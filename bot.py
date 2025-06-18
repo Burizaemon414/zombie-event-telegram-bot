@@ -15,6 +15,12 @@ from datetime import datetime
 
 # Google Sheet Setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+import os
+
+# สร้างไฟล์ credentials.json จาก Environment Variable
+if not os.path.exists("credentials.json"):
+    with open("credentials.json", "w") as f:
+        f.write(os.getenv("GOOGLE_CREDS_JSON"))
 creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").sheet1
