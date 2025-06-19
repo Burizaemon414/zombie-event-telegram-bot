@@ -1,4 +1,3 @@
-
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,19 +11,31 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import re
 from datetime import datetime
-
-# Google Sheet Setup
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 import os
+import json
+import base64  # ← ใช้สำหรับ decode base64 credentials
 
-# สร้างไฟล์ credentials.json จาก Environment Variable
-if not os.path.exists("credentials.json"):
-    with open("credentials.json", "w") as f:
-        f.write(os.getenv("GOOGLE_CREDS_JSON"))
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+# ====== Google Sheet Setup ======
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+# ✅ ดึงข้อมูลจาก GOOGLE_CREDS_JSON ทั้งจาก base64 หรือ fallback เป็นไฟล์
+creds_json_str = os.getenv("GOOGLE_CREDS_JSON")
+if not creds_json_str:
+    # fallback สำหรับเครื่อง local: โหลดจากไฟล์
+    with open("GOOGLE_CREDS_JSON.json", "r") as f:
+        creds_json_str = f.read()
+else:
+    try:
+        creds_json_str = base64.b64decode(creds_json_str).decode("utf-8")
+    except Exception:
+        raise ValueError("GOOGLE_CREDS_JSON is not valid base64 or JSON string")
+
+credentials_info = json.loads(creds_json_str)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
 client = gspread.authorize(creds)
 sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").sheet1
 
+# ====== Bot Config ======
 ASK_INFO = range(1)
 GROUP_ID = -1002561643127  # กลุ่ม ZOMBIE
 
@@ -67,7 +78,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif any(b in line for b in ["ไทยพาณิชย์", "กสิกร", "กรุงศรี", "กรุงไทย", "ทหารไทย", "ธนาคาร"]):
             bank = line
 
-    # ตรวจสอบว่าครบหรือไม่
     required_fields = [name, phone, bank, account, email, tg_user]
     if any(not field for field in required_fields):
         await update.message.reply_text(
@@ -90,7 +100,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Save to Google Sheet
     sheet.append_row([name, phone, bank, account, email, tg_name, tg_user, username, str(user_id), status_text, now])
 
     confirm_message = (
@@ -124,8 +133,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
     return ConversationHandler.END
 
-# Build Application
-app = ApplicationBuilder().token("8137922853:AAFEuJXVf_REm2tSF7kkruVVBEQaj87PU-Y").build()
+# ====== Run Bot ======
+bot_token = os.getenv("BOT_TOKEN")
+if not bot_token:
+    raise ValueError("Environment variable BOT_TOKEN not found")
+
+app = ApplicationBuilder().token(bot_token).build()
 
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler("start", start)],
