@@ -94,7 +94,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "@username Telegram :"
         )
         return ASK_INFO
-
+# force update
 
     user = update.message.from_user
     user_id = user.id
