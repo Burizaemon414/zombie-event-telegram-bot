@@ -1,3 +1,4 @@
+
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,37 +14,44 @@ import re
 from datetime import datetime
 import os
 import json
-import base64  # ← ใช้สำหรับ decode base64 credentials
+import base64
 
-# ====== Google Sheet Setup ======
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# ✅ ดึงข้อมูลจาก GOOGLE_CREDS_JSON ทั้งจาก base64 หรือ fallback เป็นไฟล์
-creds_json_str = os.getenv("GOOGLE_CREDS_JSON")
-if not creds_json_str:
-    # fallback สำหรับเครื่อง local: โหลดจากไฟล์
-    with open("GOOGLE_CREDS_JSON.json", "r") as f:
-        creds_json_str = f.read()
-else:
-    try:
-        creds_json_str = base64.b64decode(creds_json_str).decode("utf-8")
-    except Exception:
-        raise ValueError("GOOGLE_CREDS_JSON is not valid base64 or JSON string")
+creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
+if not creds_b64:
+    raise ValueError("Environment variable GOOGLE_CREDS_JSON not found")
 
+creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
 credentials_info = json.loads(creds_json_str)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
 client = gspread.authorize(creds)
 sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").sheet1
 
-# ====== Bot Config ======
 ASK_INFO = range(1)
-GROUP_ID = -1002561643127  # กลุ่ม ZOMBIE
+GROUP_ID = -1002561643127
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
-        "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม\n\n"
-        "📌 กรุณาส่งข้อมูลทั้งหมดในรูปแบบข้อความ เช่น:\n\n"
-        "ชื่อ นามสกุล\nเบอร์โทร\nธนาคาร\nเลขบัญชี\nอีเมล\nชื่อเทเลแกรม\n@username"
+        "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม
+
+"
+        "📌 กรุณาก๊อปข้อความด้านล่างนี้แล้วเติมข้อมูลให้ครบทุกช่อง:
+
+"
+        "ชื่อ - นามสกุล : 
+"
+        "เบอร์โทร : 
+"
+        "ธนาคาร : 
+"
+        "เลขบัญชี : 
+"
+        "อีเมล : 
+"
+        "ชื่อเทเลแกรม : 
+"
+        "@username Telegram : "
     )
     keyboard = [[KeyboardButton("เริ่มต้นส่งข้อมูล ✅")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -54,36 +62,54 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
 
-    name = phone = bank = account = email = tg_name = tg_user = ""
-
-    if len(lines) >= 1:
-        name = lines[0]
+    data = {
+        "name": "",
+        "phone": "",
+        "bank": "",
+        "account": "",
+        "email": "",
+        "tg_name": "",
+        "tg_user": ""
+    }
 
     for line in lines:
-        if line.startswith("ชื่อเทเลแกรม"):
-            tg_name = line.replace("ชื่อเทเลแกรม", "").strip()
-        elif line.startswith("ยูสเซอร์เทเลแกรม"):
-            tg_user = line.replace("ยูสเซอร์เทเลแกรม", "").strip()
-        elif line.startswith("@") and not tg_user:
-            tg_user = line.strip()
-        elif line.isdigit() and len(line) >= 9:
-            if not phone:
-                phone = line
-            else:
-                account = line
-        elif "@" in line:
+        if line.lower().startswith("ชื่อ") and "@" not in line:
+            data["name"] = line.split(":", 1)[-1].strip()
+        elif "เบอร์" in line:
+            data["phone"] = line.split(":", 1)[-1].strip()
+        elif "ธนาคาร" in line:
+            data["bank"] = line.split(":", 1)[-1].strip()
+        elif "บัญชี" in line:
+            data["account"] = line.split(":", 1)[-1].strip()
+        elif "อีเมล" in line:
             match = re.search(r"[\w.-]+@[\w.-]+\.\w+", line)
             if match:
-                email = match.group()
-        elif any(b in line for b in ["ไทยพาณิชย์", "กสิกร", "กรุงศรี", "กรุงไทย", "ทหารไทย", "ธนาคาร"]):
-            bank = line
+                data["email"] = match.group()
+        elif "ชื่อเทเลแกรม" in line:
+            data["tg_name"] = line.split(":", 1)[-1].strip()
+        elif "@" in line:
+            data["tg_user"] = line.strip()
 
-    required_fields = [name, phone, bank, account, email, tg_user]
-    if any(not field for field in required_fields):
+    if any(not v for v in data.values()):
         await update.message.reply_text(
-            "❗ ข้อมูลยังไม่ครบหรือรูปแบบไม่ถูกต้อง\n"
-            "กรุณาตรวจสอบให้แน่ใจว่าได้กรอกครบทุกบรรทัดตามตัวอย่างที่ระบุไว้\n\n"
-            "เช่น:\nชื่อ นามสกุล\nเบอร์โทร\nธนาคาร\nเลขบัญชี\nอีเมล\nชื่อเทเลแกรม\n@username"
+            "❗ ข้อมูลยังไม่ครบหรือรูปแบบไม่ถูกต้อง
+"
+            "กรุณาตรวจสอบและกรอกให้ครบทุกช่องตามนี้:
+
+"
+            "ชื่อ - นามสกุล : 
+"
+            "เบอร์โทร : 
+"
+            "ธนาคาร : 
+"
+            "เลขบัญชี : 
+"
+            "อีเมล : 
+"
+            "ชื่อเทเลแกรม : 
+"
+            "@username Telegram : "
         )
         return ASK_INFO
 
@@ -100,14 +126,24 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    sheet.append_row([name, phone, bank, account, email, tg_name, tg_user, username, str(user_id), status_text, now])
+    sheet.append_row([
+        data["name"], data["phone"], data["bank"], data["account"],
+        data["email"], data["tg_name"], data["tg_user"],
+        username, str(user_id), status_text, now
+    ])
 
     confirm_message = (
-        f"✅ ขอบคุณ 🙏🏻 {name} สำหรับการยืนยันตัวตน\n"
-        f"สถานะ: {status_text}\n\n"
-        "👑 *ขั้นตอนถัดไป:*\n"
-        "1️⃣ แคปหน้าจอข้อความนี้\n"
-        "2️⃣ แอดไลน์เพื่อแจ้งแอดมิน\n"
+        f"✅ ขอบคุณ 🙏🏻 {data['name']} สำหรับการยืนยันตัวตน
+"
+        f"สถานะ: {status_text}
+
+"
+        "👑 *ขั้นตอนถัดไป:*
+"
+        "1️⃣ แคปหน้าจอข้อความนี้
+"
+        "2️⃣ แอดไลน์เพื่อแจ้งแอดมิน
+"
         "⚠️ *สิทธิเครดิตฟรีจะได้รับเฉพาะผู้ที่ทำตามขั้นตอนครบเท่านั้น*"
     )
 
@@ -133,7 +169,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
     return ConversationHandler.END
 
-# ====== Run Bot ======
 bot_token = os.getenv("BOT_TOKEN")
 if not bot_token:
     raise ValueError("Environment variable BOT_TOKEN not found")
