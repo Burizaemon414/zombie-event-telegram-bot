@@ -1,3 +1,4 @@
-credentials.json
-credentials.json
 GOOGLE_CREDS_JSON.json
+*.pyc
+__pycache__/
+.env
