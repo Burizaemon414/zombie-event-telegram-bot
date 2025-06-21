@@ -41,11 +41,11 @@ creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
 credentials_info = json.loads(creds_json_str)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
 client = gspread.authorize(creds)
-sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").sheet1
+sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").worksheet("ข้อมูลลูกค้า")
 
 # ====== Bot Config ======
 ASK_INFO = range(1)
-GROUP_ID = -1002561643127  # แก้เป็น Group ID ของคุณ
+GROUP_ID = -1002561643127  # เปลี่ยนเป็น group id ของคุณ
 
 def build_redirect_url(house_key, user_id):
     return f"https://activate-creditfree.slotzombies.net/?house={house_key}&uid={user_id}"
@@ -135,7 +135,9 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         str(user_id),
         status_text,
         now,
-        "PENDING"
+        "PENDING",
+        "",
+        ""
     ])
 
     await update.message.reply_text(confirm_message, parse_mode="Markdown", reply_markup=reply_markup)
@@ -146,7 +148,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ====== Telegram Bot Setup ======
-from telegram.ext import Application
 bot_token = os.getenv("BOT_TOKEN")
 if not bot_token:
     raise ValueError("Environment variable BOT_TOKEN not found")
@@ -205,9 +206,12 @@ def log_click():
         return 'error', 500
 
 # ====== Run Telegram + Flask ======
+def run_telegram():
+    app.run_polling()
+
 def run_flask():
     flask_app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
     Thread(target=run_flask).start()
-    app.run_polling()
+    run_telegram()
