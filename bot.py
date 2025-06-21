@@ -95,7 +95,11 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         in_group = False
 
     status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # ใช้เวลา Bangkok timezone
+    import pytz
+    bangkok_tz = pytz.timezone('Asia/Bangkok')
+    now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     house_keys = [
         ("💀 ZOMBIE XO", "ZOMBIE_XO"),
@@ -123,6 +127,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    # เพิ่มแถวใหม่ทุกครั้ง (ไม่ตรวจสอบว่ามีอยู่แล้วหรือไม่)
     sheet.append_row([
         data.get("ชื่อ - นามสกุล", ""),
         data.get("เบอร์โทร", ""),
@@ -135,9 +140,8 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         str(user_id),
         status_text,
         now,
-        "PENDING",
-        "",
-        ""
+        "PENDING",  # บ้านที่รับเครดิตฟรี (เริ่มต้นเป็น PENDING)
+        ""  # บ้านที่เคยกดเข้าไปดู
     ])
 
     await update.message.reply_text(confirm_message, parse_mode="Markdown", reply_markup=reply_markup)
@@ -173,51 +177,36 @@ def go():
         return f"Unknown house: {house}", 400
     
     # บันทึกข้อมูลการคลิกลง Google Sheet
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import pytz
+    bangkok_tz = pytz.timezone('Asia/Bangkok')
+    now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
+    
     try:
-        # ค้นหา user_id ใน sheet
-        cell = sheet.find(str(uid))
-        if cell:
+        # ค้นหา user_id ใน sheet (หาจากแถวล่าสุด)
+        all_cells = sheet.findall(str(uid))
+        if all_cells:
+            # ใช้แถวล่าสุดที่พบ
+            cell = all_cells[-1]  # เอาตัวสุดท้าย
             row = cell.row
-            print(f"✅ พบ user_id {uid} ที่แถว {row}")
+            print(f"✅ พบ user_id {uid} ที่แถว {row} (แถวล่าสุด)")
             
-            # อัพเดทบ้านล่าสุดที่คลิก (คอลัมน์ 12)
-            sheet.update_cell(row, 12, house)
-            print(f"🏠 อัพเดทบ้านล่าสุด: {house}")
+            # อัพเดทบ้านที่รับเครดิตฟรี (คอลัมน์ 12)
+            current_house = sheet.cell(row, 12).value
+            if current_house == "PENDING":
+                sheet.update_cell(row, 12, house)
+                print(f"🏠 อัพเดทบ้านที่รับเครดิตฟรี: {house}")
             
-            # อัพเดทรายการบ้านที่เคยคลิกทั้งหมด (คอลัมน์ 13)
-            current_houses = sheet.cell(row, 13).value or ""
-            if house not in current_houses:
-                updated_houses = f"{current_houses},{house}" if current_houses else house
+            # อัพเดทรายการบ้านที่เคยกดเข้าไปดู (คอลัมน์ 13)
+            visited_houses = sheet.cell(row, 13).value or ""
+            if house not in visited_houses:
+                updated_houses = f"{visited_houses},{house}" if visited_houses else house
                 sheet.update_cell(row, 13, updated_houses)
-                print(f"📝 เพิ่ม {house} ในรายการบ้านที่เคยคลิก: {updated_houses}")
+                print(f"📝 เพิ่ม {house} ในรายการบ้านที่เคยกด: {updated_houses}")
             else:
-                print(f"🔄 {house} เคยคลิกแล้ว")
-            
-            # อัพเดทเวลาคลิกล่าสุด (คอลัมน์ 14)
-            sheet.update_cell(row, 14, f"{house} @ {now}")
-            print(f"⏰ บันทึกเวลาคลิก: {house} @ {now}")
+                print(f"🔄 {house} เคยกดแล้ว")
             
         else:
             print(f"❌ ไม่พบ user_id {uid} ในชีต")
-            # เพิ่มแถวใหม่ถ้าไม่พบ user
-            sheet.append_row([
-                "",  # ชื่อ-นามสกุล
-                "",  # เบอร์โทร
-                "",  # ธนาคาร
-                "",  # เลขบัญชี
-                "",  # อีเมล
-                "",  # ชื่อเทเลแกรม
-                "",  # @username telegram
-                "",  # username
-                str(uid),  # user_id
-                "❓ ไม่ทราบสถานะ",  # สถานะการเข้ากลุ่ม
-                now,  # เวลาลงทะเบียน
-                house,  # บ้านล่าสุด
-                house,  # รายการบ้านที่คลิก
-                f"{house} @ {now}"  # เวลาคลิกล่าสุด
-            ])
-            print(f"➕ เพิ่ม user_id {uid} ใหม่ในชีต")
             
     except Exception as e:
         print(f"❌ Error updating sheet: {e}")
