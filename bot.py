@@ -289,4 +289,4 @@ if __name__ == "__main__":
 
     # Start bot
     print("🤖 Bot is starting...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
