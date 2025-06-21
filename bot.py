@@ -3,7 +3,7 @@ import json
 import base64
 from datetime import datetime
 from threading import Thread
-from flask import Flask, request
+from flask import Flask, request, redirect
 from flask_cors import CORS
 
 from dotenv import load_dotenv
@@ -48,7 +48,7 @@ ASK_INFO = range(1)
 GROUP_ID = -1002561643127  # เปลี่ยนเป็น group id ของคุณ
 
 def build_redirect_url(house_key, user_id):
-    return f"https://activate-creditfree.slotzombies.net/?house={house_key}&uid={user_id}"
+    return f"https://zombie-event-telegram-bot.onrender.com/go?house={house_key}&uid={user_id}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
@@ -150,6 +150,81 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====== Flask App สำหรับ log_click ======
 flask_app = Flask(__name__)
 CORS(flask_app)
+
+@flask_app.route("/go")
+def go():
+    """Route สำหรับ redirect และเก็บ log การคลิก"""
+    LINE_HOUSE_LINKS = {
+        "ZOMBIE_XO": "https://lin.ee/SgguCbJ",
+        "ZOMBIE_PG": "https://lin.ee/ETELgrN",
+        "ZOMBIE_KING": "https://lin.ee/fJilKIf",
+        "ZOMBIE_ALL": "https://lin.ee/9eogsb8e",
+        "GENBU88": "https://lin.ee/JCCXt06"
+    }
+    
+    house = request.args.get("house", "").upper()
+    uid = request.args.get("uid")
+    
+    if not house or not uid:
+        return "Missing parameters", 400
+    
+    link = LINE_HOUSE_LINKS.get(house)
+    if not link:
+        return f"Unknown house: {house}", 400
+    
+    # บันทึกข้อมูลการคลิกลง Google Sheet
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # ค้นหา user_id ใน sheet
+        cell = sheet.find(str(uid))
+        if cell:
+            row = cell.row
+            print(f"✅ พบ user_id {uid} ที่แถว {row}")
+            
+            # อัพเดทบ้านล่าสุดที่คลิก (คอลัมน์ 12)
+            sheet.update_cell(row, 12, house)
+            print(f"🏠 อัพเดทบ้านล่าสุด: {house}")
+            
+            # อัพเดทรายการบ้านที่เคยคลิกทั้งหมด (คอลัมน์ 13)
+            current_houses = sheet.cell(row, 13).value or ""
+            if house not in current_houses:
+                updated_houses = f"{current_houses},{house}" if current_houses else house
+                sheet.update_cell(row, 13, updated_houses)
+                print(f"📝 เพิ่ม {house} ในรายการบ้านที่เคยคลิก: {updated_houses}")
+            else:
+                print(f"🔄 {house} เคยคลิกแล้ว")
+            
+            # อัพเดทเวลาคลิกล่าสุด (คอลัมน์ 14)
+            sheet.update_cell(row, 14, f"{house} @ {now}")
+            print(f"⏰ บันทึกเวลาคลิก: {house} @ {now}")
+            
+        else:
+            print(f"❌ ไม่พบ user_id {uid} ในชีต")
+            # เพิ่มแถวใหม่ถ้าไม่พบ user
+            sheet.append_row([
+                "",  # ชื่อ-นามสกุล
+                "",  # เบอร์โทร
+                "",  # ธนาคาร
+                "",  # เลขบัญชี
+                "",  # อีเมล
+                "",  # ชื่อเทเลแกรม
+                "",  # @username telegram
+                "",  # username
+                str(uid),  # user_id
+                "❓ ไม่ทราบสถานะ",  # สถานะการเข้ากลุ่ม
+                now,  # เวลาลงทะเบียน
+                house,  # บ้านล่าสุด
+                house,  # รายการบ้านที่คลิก
+                f"{house} @ {now}"  # เวลาคลิกล่าสุด
+            ])
+            print(f"➕ เพิ่ม user_id {uid} ใหม่ในชีต")
+            
+    except Exception as e:
+        print(f"❌ Error updating sheet: {e}")
+    
+    # Redirect ไป LINE
+    print(f"↗️ Redirect {uid} ไปยัง {house}: {link}")
+    return redirect(link, code=302)
 
 @flask_app.route("/log_click", methods=["POST"])
 def log_click():
