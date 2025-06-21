@@ -45,7 +45,7 @@ sheet = client.open("เครดิตฟรี กลุ่ม กิจกร
 
 # ====== Bot Config ======
 ASK_INFO = range(1)
-GROUP_ID = -1002561643127  # แก้เป็น Group ID ของคุณ
+GROUP_ID = -1002561643127  # เปลี่ยนเป็น group id ของคุณ
 
 def build_redirect_url(house_key, user_id):
     return f"https://activate-creditfree.slotzombies.net/?house={house_key}&uid={user_id}"
@@ -146,7 +146,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ====== Telegram Bot Setup ======
-from telegram.ext import Application
 bot_token = os.getenv("BOT_TOKEN")
 if not bot_token:
     raise ValueError("Environment variable BOT_TOKEN not found")
@@ -174,10 +173,12 @@ def log_click():
         user_id = str(data.get("uid"))
         time = data.get("time", datetime.utcnow().isoformat())
 
+        # ตรวจสอบข้อมูลที่จำเป็น
         if not house or not user_id:
             print("⚠️ house หรือ uid หายไป")
             return 'invalid', 400
 
+        # 🔍 หาแถวของ user_id
         try:
             cell = sheet.find(user_id)
         except Exception as e:
@@ -187,9 +188,11 @@ def log_click():
         row = cell.row
         print(f"✅ เจอ user_id ที่ row {row}")
 
+        # ✅ คอลัมน์ L (12) → บ้านล่าสุดที่กด
         sheet.update_cell(row, 12, house)
         print(f"🏠 อัปเดตคอลัมน์ L (12): {house}")
 
+        # ✅ คอลัมน์ M (13) → บ้านที่เคยกดทั้งหมด (สะสม)
         current = sheet.cell(row, 13).value or ""
         if house not in current:
             updated = f"{current},{house}" if current else house
@@ -205,6 +208,9 @@ def log_click():
         return 'error', 500
 
 # ====== Run Telegram + Flask ======
+def run_telegram():
+    app.run_polling()
+
 def run_flask():
     flask_app.run(host="0.0.0.0", port=10000)
 
