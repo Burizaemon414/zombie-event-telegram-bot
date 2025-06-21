@@ -147,20 +147,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
     return ConversationHandler.END
 
-# ====== Telegram Bot Setup ======
-bot_token = os.getenv("BOT_TOKEN")
-if not bot_token:
-    raise ValueError("Environment variable BOT_TOKEN not found")
-
-app = ApplicationBuilder().token(bot_token).build()
-
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
-    states={ASK_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_info)]},
-    fallbacks=[CommandHandler("cancel", cancel)]
-)
-app.add_handler(conv_handler)
-
 # ====== Flask App สำหรับ log_click ======
 flask_app = Flask(__name__)
 CORS(flask_app)
@@ -205,13 +191,27 @@ def log_click():
         print("❌ ERROR ใน log_click:", e)
         return 'error', 500
 
-# ====== Run Telegram + Flask ======
-def run_telegram():
-    app.run_polling()
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=10000)
-
+# ====== Main function สำหรับ Render ======
 if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    run_telegram()
+    # Initialize bot
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        raise ValueError("Environment variable BOT_TOKEN not found")
+
+    app = ApplicationBuilder().token(bot_token).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={ASK_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_info)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    app.add_handler(conv_handler)
+
+    # Start Flask in a separate thread
+    flask_thread = Thread(target=lambda: flask_app.run(host="0.0.0.0", port=10000))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Start bot
+    print("🤖 Bot is starting...")
+    app.run_polling()
