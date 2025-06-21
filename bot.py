@@ -151,9 +151,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
     return ConversationHandler.END
 
-# ====== Flask App สำหรับ log_click ======
+# ====== Flask App สำหรับ log_click และ health check ======
 flask_app = Flask(__name__)
 CORS(flask_app)
+
+@flask_app.route("/")
+def home():
+    return "🤖 Zombie Event Bot is running! ✅"
+
+@flask_app.route("/health")
+def health_check():
+    """Health check endpoint สำหรับ UptimeRobot"""
+    import pytz
+    bangkok_tz = pytz.timezone('Asia/Bangkok')
+    current_time = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "status": "healthy",
+        "bot": "zombie-event-telegram-bot",
+        "time": current_time,
+        "message": "Bot is running normally! 🟢"
+    }
 
 @flask_app.route("/go")
 def go():
@@ -291,4 +308,6 @@ if __name__ == "__main__":
 
     # Start bot
     print("🤖 Bot is starting...")
+    print("🌐 Health check available at: /health")
+    print("🔗 Redirect handler available at: /go")
     app.run_polling(drop_pending_updates=True)
