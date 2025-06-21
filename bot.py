@@ -182,28 +182,41 @@ def go():
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
     try:
-        # ค้นหา user_id ใน sheet (หาจากแถวล่าสุด)
+        # ค้นหา user_id ทั้งหมดใน sheet
         all_cells = sheet.findall(str(uid))
         if all_cells:
-            # ใช้แถวล่าสุดที่พบ
-            cell = all_cells[-1]  # เอาตัวสุดท้าย
-            row = cell.row
-            print(f"✅ พบ user_id {uid} ที่แถว {row} (แถวล่าสุด)")
+            # หาแถวล่าสุด
+            last_cell = all_cells[-1]
+            last_row = last_cell.row
+            print(f"✅ พบ user_id {uid} ที่แถว {last_row} (แถวล่าสุด)")
+            
+            # รวบรวมบ้านที่เคยกดจากแถวก่อนหน้า (ไม่รวมแถวปัจจุบัน)
+            all_houses = []
+            
+            # ดึงบ้านจากแถวก่อนหน้าทั้งหมด
+            for i, cell in enumerate(all_cells[:-1]):  # ไม่รวมแถวล่าสุด
+                row = cell.row
+                # บ้านที่รับเครดิตฟรี (คอลัมน์ 12)
+                house_credit = sheet.cell(row, 12).value
+                if house_credit and house_credit != "PENDING" and house_credit not in all_houses:
+                    all_houses.append(house_credit)
+            
+            # เพิ่มบ้านที่กดครั้งนี้
+            if house not in all_houses:
+                all_houses.append(house)
+            
+            # สร้าง string ของบ้านทั้งหมด
+            all_houses_str = ",".join(all_houses)
             
             # อัพเดทบ้านที่รับเครดิตฟรี (คอลัมน์ 12)
-            current_house = sheet.cell(row, 12).value
+            current_house = sheet.cell(last_row, 12).value
             if current_house == "PENDING":
-                sheet.update_cell(row, 12, house)
+                sheet.update_cell(last_row, 12, house)
                 print(f"🏠 อัพเดทบ้านที่รับเครดิตฟรี: {house}")
             
-            # อัพเดทรายการบ้านที่เคยกดเข้าไปดู (คอลัมน์ 13)
-            visited_houses = sheet.cell(row, 13).value or ""
-            if house not in visited_houses:
-                updated_houses = f"{visited_houses},{house}" if visited_houses else house
-                sheet.update_cell(row, 13, updated_houses)
-                print(f"📝 เพิ่ม {house} ในรายการบ้านที่เคยกด: {updated_houses}")
-            else:
-                print(f"🔄 {house} เคยกดแล้ว")
+            # อัพเดทรายการบ้านที่เคยกดสะสม (คอลัมน์ 13)
+            sheet.update_cell(last_row, 13, all_houses_str)
+            print(f"📝 อัพเดทรายการบ้านสะสม: {all_houses_str}")
             
         else:
             print(f"❌ ไม่พบ user_id {uid} ในชีต")
