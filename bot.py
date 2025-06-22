@@ -35,11 +35,11 @@ from telegram.error import Conflict, NetworkError, TelegramError
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ====== Optimized Logging ======
+# ====== Logging ======
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]  # ไม่เขียนไฟล์ประหยัด memory
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -52,22 +52,7 @@ def log_memory_usage(context=""):
     logger.info(f"💾 Memory {context}: {memory_mb:.1f} MB")
     return memory_mb
 
-# ====== Graceful Shutdown ======
-class GracefulShutdown:
-    shutdown = False
-    
-    @classmethod
-    def signal_handler(cls, sig, frame):
-        logger.info('Graceful shutdown initiated...')
-        cls.shutdown = True
-        # Force garbage collection
-        gc.collect()
-        sys.exit(0)
-
-signal.signal(signal.SIGINT, GracefulShutdown.signal_handler)
-signal.signal(signal.SIGTERM, GracefulShutdown.signal_handler)
-
-# ====== Optimized Google Sheet Connection ======
+# ====== Google Sheet Manager ======
 class LightweightSheetManager:
     def __init__(self):
         self.sheet = None
@@ -79,17 +64,14 @@ class LightweightSheetManager:
         """Get sheet with connection pooling"""
         with self._lock:
             now = time.time()
-            # Reuse connection if recent
             if self.sheet and self.last_connect and (now - self.last_connect < self.connect_interval):
                 return self.sheet
             
             try:
-                # Close old connection
                 if self.sheet:
                     del self.sheet
                     gc.collect()
                 
-                # Create new connection
                 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
                 creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
                 creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
@@ -107,21 +89,19 @@ class LightweightSheetManager:
                 logger.error(f"❌ Sheet connection error: {e}")
                 return None
 
-# Initialize managers
+# Initialize
 sheet_manager = LightweightSheetManager()
 
-# ====== Bot Config ======
+# Bot Config
 ASK_INFO = range(1)
 GROUP_ID = -1002561643127
 
-# Lightweight storage (max 100 items)
 from collections import deque
 pending_saves = deque(maxlen=100)
 failed_saves = deque(maxlen=50)
 
 # ====== Bot Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Log memory at start
     log_memory_usage("at start command")
     
     welcome_message = (
@@ -144,12 +124,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
-    # Quick validation
     if text.count(":") < 5:
         await update.message.reply_text("❗ ข้อมูลไม่ครบ กรุณากรอกให้ครบทุกช่อง")
         return ASK_INFO
     
-    # Parse data
     data = {}
     for line in text.strip().splitlines():
         if ':' in line:
@@ -164,7 +142,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or "ไม่มี"
     
-    # Check group membership
     try:
         member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
         in_group = member.status in ['member', 'administrator', 'creator']
@@ -173,7 +150,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
     
-    # Prepare data
     import pytz
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -194,7 +170,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ""
     ]
     
-    # Try to save immediately
     saved = False
     sheet = sheet_manager.get_sheet()
     if sheet:
@@ -209,7 +184,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_saves.append(user_data)
         logger.warning(f"⏳ Added to pending queue: {user_id}")
     
-    # Send confirmation
     house_keys = [
         ("💀 ZOMBIE XO", "ZOMBIE_XO"),
         ("👾 ZOMBIE PG", "ZOMBIE_PG"),
@@ -244,7 +218,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    # Force garbage collection
     gc.collect()
     log_memory_usage("after save")
     
@@ -257,46 +230,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Exception: {context.error}")
 
-# ====== Background Tasks ======
-async def process_pending_saves():
-    """Process pending saves every 30 seconds"""
-    while not GracefulShutdown.shutdown:
-        await asyncio.sleep(30)
-        
-        if pending_saves:
-            sheet = sheet_manager.get_sheet()
-            if sheet:
-                # Process max 10 at a time
-                for _ in range(min(10, len(pending_saves))):
-                    try:
-                        data = pending_saves.popleft()
-                        sheet.append_row(data)
-                        await asyncio.sleep(0.5)  # Rate limit
-                    except Exception as e:
-                        logger.error(f"Background save error: {e}")
-                        failed_saves.append(data)
-        
-        # Memory cleanup
-        gc.collect()
-
-async def memory_monitor():
-    """Monitor memory every 2 minutes"""
-    while not GracefulShutdown.shutdown:
-        await asyncio.sleep(120)
-        
-        memory_mb = log_memory_usage("periodic check")
-        
-        # Warning at 1.5GB
-        if memory_mb > 1500:
-            logger.warning(f"⚠️ High memory usage: {memory_mb:.1f} MB")
-            gc.collect()
-            
-            # Critical at 1.8GB - restart
-            if memory_mb > 1800:
-                logger.error("❌ Memory critical! Restarting...")
-                os._exit(1)
-
-# ====== Flask App (Minimal) ======
+# ====== Flask App ======
 flask_app = Flask(__name__)
 CORS(flask_app)
 
@@ -328,56 +262,45 @@ def go():
     uid = request.args.get("uid")
     
     if house in LINKS:
-        # Log click without heavy processing
         logger.info(f"Click: {uid} -> {house}")
         return redirect(LINKS[house], 302)
     
     return "Invalid request", 400
 
-# ====== Main with PID Lock ======
+# ====== Main ======
 def main():
-    # Check PID file
-    pid_file = '/tmp/zombie_bot.pid'
+    # Start Flask FIRST (for port detection)
+    logger.info("🌐 Starting Flask server on port 10000...")
+    flask_thread = Thread(
+        target=lambda: flask_app.run(
+            host="0.0.0.0", 
+            port=10000,
+            debug=False,
+            use_reloader=False
+        ),
+        daemon=True
+    )
+    flask_thread.start()
     
-    # Clean up old PID
-    if os.path.exists(pid_file):
-        try:
-            with open(pid_file, 'r') as f:
-                old_pid = int(f.read())
-            os.kill(old_pid, 0)  # Check if running
-            logger.error("❌ Bot already running!")
-            sys.exit(1)
-        except:
-            os.remove(pid_file)
+    # Wait for Flask to start
+    time.sleep(2)
     
-    # Write PID
-    with open(pid_file, 'w') as f:
-        f.write(str(os.getpid()))
+    # Initialize bot
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise ValueError("No BOT_TOKEN in environment")
     
     try:
-        # Start Flask
-        flask_thread = Thread(
-            target=lambda: flask_app.run(host="0.0.0.0", port=10000),
-            daemon=True
-        )
-        flask_thread.start()
-        
-        # Initialize bot with optimizations
-        token = os.getenv("BOT_TOKEN")
-        if not token:
-            raise ValueError("No BOT_TOKEN in environment")
-        
         app = (
             ApplicationBuilder()
             .token(token)
-            .connection_pool_size(4)  # Reduce connections
+            .connection_pool_size(4)
             .pool_timeout(20.0)
             .read_timeout(10.0)
             .write_timeout(10.0)
             .build()
         )
         
-        # Add handlers
         app.add_error_handler(error_handler)
         
         conv_handler = ConversationHandler(
@@ -387,40 +310,29 @@ def main():
         )
         app.add_handler(conv_handler)
         
-        # Start background tasks
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Create tasks
-        loop.create_task(process_pending_saves())
-        loop.create_task(memory_monitor())
-        
-        # Start async tasks
-        async_thread = Thread(target=loop.run_forever, daemon=True)
-        async_thread.start()
-        
-        # Initial memory log
         log_memory_usage("at startup")
         
         logger.info("🤖 Optimized bot starting...")
         logger.info("📊 Memory limit: 2GB")
-        logger.info("🌐 Health: /health")
+        logger.info("🌐 Health: http://0.0.0.0:10000/health")
         
-        # Run bot
+        # Run bot (blocking)
         app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
         )
         
-    except Conflict:
-        logger.error("❌ Conflict: Another instance running")
+    except Conflict as e:
+        logger.error(f"Conflict: {str(e)}")
         time.sleep(30)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
+        logger.error(f"Fatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
-        if os.path.exists(pid_file):
-            os.remove(pid_file)
-        gc.collect()
+        logger.info("Bot stopped")
 
 if __name__ == "__main__":
     main()
