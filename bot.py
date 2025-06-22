@@ -252,14 +252,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     welcome_message = (
         "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม\n\n"
-        "📌 กรุณาก๊อปข้อความด้านล่างแล้วกรอกข้อมูล:\n\n"
+        "📌 กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลังเครื่องหมาย : \n\n"
         "ชื่อ - นามสกุล : \n"
         "เบอร์โทร : \n"
         "ธนาคาร : \n"
         "เลขบัญชี : \n"
         "อีเมล : \n"
         "ชื่อเทเลแกรม : \n"
-        "@username Telegram :"
+        "@username Telegram : \n\n"
+        "⚠️ อย่าลืม! แค่เติมข้อมูลหลัง : เท่านั้น อย่าแก้ไขส่วนหน้า"
     )
     
     keyboard = [[KeyboardButton("เริ่มต้นส่งข้อมูล ✅")]]
@@ -283,20 +284,59 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Skip if it's just the button text
     if text == "เริ่มต้นส่งข้อมูล ✅":
         await update.message.reply_text(
-            "กรุณากรอกข้อมูลตามรูปแบบที่กำหนด:\n\n"
-            "ชื่อ - นามสกุล : ชื่อของคุณ\n"
-            "เบอร์โทร : เบอร์ของคุณ\n"
-            "ธนาคาร : ธนาคารของคุณ\n"
-            "เลขบัญชี : เลขบัญชีของคุณ\n"
-            "อีเมล : อีเมลของคุณ\n"
-            "ชื่อเทเลแกรม : ชื่อเทเลแกรมของคุณ\n"
-            "@username Telegram : @username ของคุณ"
+            "📋 กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลของคุณหลังเครื่องหมาย : \n\n"
+            "ชื่อ - นามสกุล : ใส่ชื่อของคุณ\n"
+            "เบอร์โทร : ใส่เบอร์ของคุณ\n"
+            "ธนาคาร : ใส่ธนาคารของคุณ\n"
+            "เลขบัญชี : ใส่เลขบัญชีของคุณ\n"
+            "อีเมล : ใส่อีเมลของคุณ\n"
+            "ชื่อเทเลแกรม : ใส่ชื่อเทเลแกรมของคุณ\n"
+            "@username Telegram : ใส่ @username ของคุณ\n\n"
+            "💡 ตัวอย่าง:\n"
+            "ชื่อ - นามสกุล : สมชาย ใจดี\n"
+            "เบอร์โทร : 0812345678\n"
+            "ธนาคาร : กสิกรไทย\n\n"
+            "⚠️ ห้ามเปลี่ยนคำหน้าเครื่องหมาย : แค่เติมข้อมูลหลัง : เท่านั้น"
         )
         return ASK_INFO
     
     # Validate format
     if text.count(":") < 5:
-        await update.message.reply_text("❗ ข้อมูลไม่ครบหรือไม่ถูกต้อง กรุณากรอกให้ครับทุกช่องตามตัวอย่าง")
+        await update.message.reply_text(
+            "❗ ข้อมูลไม่ครบ กรุณาก๊อปข้อความจากด้านบนแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
+            "💡 ตัวอย่างที่ถูกต้อง:\n"
+            "ชื่อ - นามสกุล : สมชาย ใจดี\n"
+            "เบอร์โทร : 0812345678\n"
+            "ธนาคาร : กสิกรไทย\n"
+            "เลขบัญชี : 1234567890\n"
+            "อีเมล : somchai@email.com\n"
+            "ชื่อเทเลแกรม : สมชาย\n"
+            "@username Telegram : @somchai123"
+        )
+        return ASK_INFO
+    
+    # Check if customer modified the field names
+    expected_fields = ["ชื่อ - นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username telegram"]
+    lines_with_colon = [line.split(':', 1)[0].strip().lower() for line in text.strip().splitlines() if ':' in line]
+    
+    # Check for common field names
+    found_name = any("ชื่อ" in field and "นามสกุล" in field for field in lines_with_colon)
+    found_phone = any(any(word in field for word in ["เบอร์", "โทร", "ไทย"]) for field in lines_with_colon)
+    found_bank = any("ธนาคาร" in field for field in lines_with_colon)
+    
+    if not (found_name and found_phone and found_bank):
+        await update.message.reply_text(
+            "❗ รูปแบบไม่ถูกต้อง กรุณาใช้ template ที่กำหนดให้\n\n"
+            "📋 กรุณาก๊อปข้อความนี้แล้วเติมข้อมูล:\n\n"
+            "ชื่อ - นามสกุล : \n"
+            "เบอร์โทร : \n"
+            "ธนาคาร : \n"
+            "เลขบัญชี : \n"
+            "อีเมล : \n"
+            "ชื่อเทเลแกรม : \n"
+            "@username Telegram : \n\n"
+            "⚠️ ห้ามแก้ไขคำหน้าเครื่องหมาย : แค่เติมข้อมูลหลัง : เท่านั้น"
+        )
         return ASK_INFO
 
     # Parse data with flexible field names
@@ -305,16 +345,16 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ':' in line:
             key, value = map(str.strip, line.split(':', 1))
             
-            # Normalize field names
+            # Normalize field names - รองรับการพิมพ์หลากหลาย
             key_lower = key.lower().replace(" ", "").replace("-", "")
             
             if "ชื่อ" in key and ("นามสกุล" in key or "surname" in key.lower()):
                 data["ชื่อ - นามสกุล"] = value
-            elif "เบอร์" in key or "phone" in key.lower() or "tel" in key.lower():
+            elif any(word in key.lower() for word in ["เบอร์", "phone", "tel", "โทร", "ไทย"]):
                 data["เบอร์โทร"] = value
             elif "ธนาคาร" in key or "bank" in key.lower():
                 data["ธนาคาร"] = value
-            elif "เลข" in key and "บัญชี" in key:
+            elif ("เลข" in key and "บัญชี" in key) or "account" in key.lower():
                 data["เลขบัญชี"] = value
             elif "อีเมล" in key or "email" in key.lower():
                 data["อีเมล"] = value
@@ -322,14 +362,25 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["ชื่อเทเลแกรม"] = value
             elif "@" in key and ("username" in key.lower() or "telegram" in key):
                 data["@username telegram"] = value
+            else:
+                # Log unknown fields
+                logger.info(f"🤔 Unknown field from user {user.id}: '{key}' = '{value}'")
 
     logger.info(f"📊 Parsed data from user {user.id}:")
     for k, v in data.items():
-        logger.info(f"  {k}: '{v}'")
-
-    # Check for required fields
+        logger.info(f"  ✅ {k}: '{v}'")
+    
+    # Debug: Show what fields we're looking for vs what we found
     required_fields = ["ชื่อ - นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username telegram"]
-    missing_fields = [field for field in required_fields if not data.get(field)]
+    logger.info(f"🔍 Required fields check for user {user.id}:")
+    
+    missing_fields = []
+    for field in required_fields:
+        if data.get(field):
+            logger.info(f"  ✅ {field}: OK")
+        else:
+            logger.info(f"  ❌ {field}: MISSING")
+            missing_fields.append(field)
     
     if missing_fields:
         await update.message.reply_text(
@@ -431,19 +482,7 @@ def health_check():
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     current_time = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
-    # Memory check with fallback
-    memory_mb = 0
-    try:
-        import psutil
-        process = psutil.Process()
-        memory_mb = process.memory_info().rss / 1024 / 1024
-    except ImportError:
-        logger.warning("⚠️ psutil not available - memory monitoring disabled")
-        memory_mb = 0
-    except Exception as e:
-        logger.error(f"❌ Memory check error: {e}")
-        memory_mb = 0
-    
+    # Simple health check without memory monitoring
     health_status = "healthy"
     if len(pending_saves) > 10:
         health_status = "warning"
@@ -455,7 +494,6 @@ def health_check():
         "bot": "zombie-event-telegram-bot",
         "mode": "polling_improved",
         "time": current_time,
-        "memory_mb": round(memory_mb, 2),
         "pending_saves": len(pending_saves),
         "failed_saves": len(failed_saves),
         "group_checking": bool(TELEGRAM_GROUP_ID),
