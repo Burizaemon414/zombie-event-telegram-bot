@@ -118,10 +118,12 @@ def handle_message(update):
     text = update.message.text
     user = update.message.from_user
     
+    logger.info(f"Received message from {user.username or user.id}: {text}")
+    
     if text == "/start":
         # Send welcome message
         welcome = (
-            "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT\n\n"
+            "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม\n\n"
             "📌 กรุณาก๊อปข้อความด้านล่างแล้วกรอกข้อมูล:\n\n"
             "ชื่อ - นามสกุล : \n"
             "เบอร์โทร : \n"
@@ -131,13 +133,27 @@ def handle_message(update):
             "ชื่อเทเลแกรม : \n"
             "@username Telegram :"
         )
-        bot.send_message(chat_id, welcome)
-        user_states[chat_id] = "waiting_info"
+        
+        try:
+            bot.send_message(
+                chat_id=chat_id, 
+                text=welcome
+            )
+            logger.info(f"✅ Sent welcome to {chat_id}")
+            user_states[chat_id] = "waiting_info"
+        except Exception as e:
+            logger.error(f"❌ Error sending welcome: {e}")
         
     elif user_states.get(chat_id) == "waiting_info":
         # Process user info
         if text.count(":") < 5:
-            bot.send_message(chat_id, "❗ ข้อมูลไม่ครบ กรุณากรอกใหม่")
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="❗ ข้อมูลไม่ครบหรือไม่ถูกต้อง กรุณากรอกให้ครบทุกช่องตามตัวอย่าง"
+                )
+            except Exception as e:
+                logger.error(f"Error sending validation message: {e}")
             return
         
         # Parse data
@@ -146,6 +162,17 @@ def handle_message(update):
             if ':' in line:
                 key, value = map(str.strip, line.split(':', 1))
                 data[key.lower()] = value
+        
+        # Check if any field is empty
+        if any(not v for v in data.values()):
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="❗ บางช่องเว้นว่าง กรุณากรอกให้ครบทุกช่อง"
+                )
+            except Exception as e:
+                logger.error(f"Error sending empty field message: {e}")
+            return
         
         # Save to sheet
         import pytz
@@ -169,6 +196,8 @@ def handle_message(update):
         ]
         
         if sheet_manager.append_row(user_data):
+            logger.info(f"✅ Saved user data for {user.id}")
+            
             # Send confirmation with buttons
             houses = [
                 ("💀 ZOMBIE XO", "ZOMBIE_XO"),
@@ -189,17 +218,53 @@ def handle_message(update):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             msg = (
-                f"✅ ขอบคุณ {data.get('ชื่อ - นามสกุล', 'คุณ')} สำหรับการลงทะเบียน\n\n"
-                "📋 ขั้นตอนต่อไป:\n"
-                "1️⃣ แคปหน้าจอนี้\n"
-                "2️⃣ เลือกบ้านที่ต้องการ\n"
-                "3️⃣ แอดไลน์ติดต่อแอดมิน"
+                f"✅ ขอบคุณ 🙏🏻 {data.get('ชื่อ - นามสกุล', 'คุณ')} สำหรับการยืนยันตัวตน\n\n"
+                f"สถานะ: ไม่ทราบ\n"
+                "👑 *ขั้นตอนถัดไป:*\n"
+                "1️⃣ แคปหน้าจอข้อความนี้\n"
+                "2️⃣ แอดไลน์เพื่อแจ้งแอดมิน ติดต่อรับเครดิตฟรี\n\n"
+                "⚠️ *สิทธิเครดิตฟรีจะได้รับเฉพาะผู้ที่ทำตามขั้นตอนครบเท่านั้น*"
             )
             
-            bot.send_message(chat_id, msg, reply_markup=reply_markup)
-            user_states.pop(chat_id, None)
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                logger.info(f"✅ Sent confirmation to {chat_id}")
+                user_states.pop(chat_id, None)  # Clear state
+            except Exception as e:
+                logger.error(f"❌ Error sending confirmation: {e}")
+                # Try without markdown
+                try:
+                    msg_plain = msg.replace('*', '')
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text=msg_plain,
+                        reply_markup=reply_markup
+                    )
+                    user_states.pop(chat_id, None)
+                except Exception as e2:
+                    logger.error(f"❌ Error sending plain message: {e2}")
         else:
-            bot.send_message(chat_id, "❌ เกิดข้อผิดพลาด กรุณาลองใหม่")
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาลองใหม่อีกครั้ง"
+                )
+            except Exception as e:
+                logger.error(f"Error sending error message: {e}")
+    else:
+        # Not in any state, send default message
+        try:
+            bot.send_message(
+                chat_id=chat_id,
+                text="กรุณาพิมพ์ /start เพื่อเริ่มต้นใช้งาน"
+            )
+        except Exception as e:
+            logger.error(f"Error sending default message: {e}")
 
 def handle_callback(update):
     """Handle button callbacks"""
