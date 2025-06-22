@@ -70,8 +70,12 @@ if not TELEGRAM_GROUP_ID:
     logger.warning("⚠️ No TELEGRAM_GROUP_ID in environment - group checking disabled")
 
 # Global storage for pending saves
-pending_saves = []
-failed_saves = []
+from collections import deque
+pending_saves = deque(maxlen=100)
+failed_saves = deque(maxlen=50)
+
+# Initialize sheet manager
+sheet_manager = LightweightSheetManager()
 
 # ====== Google Sheet Setup ======
 def get_google_sheet():
@@ -99,35 +103,32 @@ def safe_append_row(data, max_retries=3):
     """บันทึกข้อมูลพร้อม retry และ backup ถ้าเกิด error"""
     for attempt in range(max_retries):
         try:
-            sheet = get_google_sheet()
-            if sheet:
-                sheet.append_row(data)
+            if sheet_manager.append_row(data):
                 logger.info(f"✅ บันทึกข้อมูลสำเร็จ (attempt {attempt + 1})")
-                return True
+                # Add memory cleanup
+        gc.collect()
+        log_memory_usage("after save")
+        
+        return True
         except Exception as e:
-            if hasattr(e, 'resp') and e.resp.status == 429:
-                wait_time = (attempt + 1) * 5
-                logger.warning(f"⏳ Rate limit! รอ {wait_time} วินาที...")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"❌ Error attempt {attempt + 1}: {e}")
-                if attempt == max_retries - 1:
-                    # บันทึก backup
-                    backup_data = {
-                        "timestamp": datetime.now().isoformat(),
-                        "data": data,
-                        "error": str(e)
-                    }
-                    failed_saves.append(backup_data)
-                    
-                    # บันทึกลงไฟล์
-                    try:
-                        with open("backup_failed_saves.json", "a", encoding='utf-8') as f:
-                            json.dump(backup_data, f, ensure_ascii=False)
-                            f.write("\n")
-                        logger.info("💾 บันทึกไว้ใน backup file")
-                    except:
-                        pass
+            logger.error(f"❌ Error attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                # บันทึก backup
+                backup_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "data": data,
+                    "error": str(e)
+                }
+                failed_saves.append(backup_data)
+                
+                # บันทึกลงไฟล์
+                try:
+                    with open("backup_failed_saves.json", "a", encoding='utf-8') as f:
+                        json.dump(backup_data, f, ensure_ascii=False)
+                        f.write("\n")
+                    logger.info("💾 บันทึกไว้ใน backup file")
+                except:
+                    pass
         
         time.sleep(1)
     
@@ -161,7 +162,7 @@ def update_house_selection(user_id, house):
         last_row = max(user_rows)
         logger.info(f"📋 Found user {user_id} at row {last_row}")
         
-        # เช็คสถานะปัจจุบัน
+        # Get current status and notes
         current_status = sheet.cell(last_row, 12).value  # Column L - บ้านที่รับเครดิตฟรี
         current_history = sheet.cell(last_row, 13).value or ""  # Column M - บ้านที่รับไปแล้ว
         
@@ -203,53 +204,34 @@ def update_house_selection(user_id, house):
         return False
 
 # ====== Group Membership Checking ======
-async def check_user_in_telegram_group(user_id: int) -> str:
-    """Check if user is in Telegram group"""
+async def check_user_in_group_async(context, user_id: int) -> str:
+    """Check if user is in Telegram group - simple and stable"""
     try:
         if not TELEGRAM_GROUP_ID:
             return "ไม่ทราบ"
         
-        # Create a temporary bot instance for checking
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        # ใช้ context.bot แบบโค้ดที่ทำงานได้
+        member = await context.bot.get_chat_member(chat_id=TELEGRAM_GROUP_ID, user_id=user_id)
+        in_group = member.status in ['member', 'administrator', 'creator']
         
-        # Get chat member status
-        chat_member = await bot.get_chat_member(chat_id=TELEGRAM_GROUP_ID, user_id=user_id)
-        
-        if chat_member.status in ['member', 'administrator', 'creator']:
-            logger.info(f"✅ User {user_id} is in group: {chat_member.status}")
-            return "✅ เข้าแล้ว"
-        elif chat_member.status in ['left', 'kicked']:
-            logger.info(f"❌ User {user_id} not in group: {chat_member.status}")
-            return "❌ ยังไม่เข้า"
+        if in_group:
+            return "✅ อยู่ในกลุ่มแล้ว"
         else:
-            logger.info(f"❓ User {user_id} unknown status: {chat_member.status}")
-            return "❓ ไม่ทราบ"
+            return "❌ ยังไม่ได้เข้ากลุ่ม"
             
     except Exception as e:
-        if "user not found" in str(e).lower():
-            logger.info(f"❌ User {user_id} not found in group")
-            return "ยังไม่เข้า"
-        else:
-            logger.error(f"❌ Error checking group membership: {e}")
-            return "ไม่ทราบ"
+        logger.error(f"❌ Error checking group for user {user_id}: {e}")
+        return "ไม่ทราบ"
 
 def check_user_in_group_sync(user_id: int) -> str:
-    """Synchronous wrapper for group checking"""
-    try:
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(check_user_in_telegram_group(user_id))
-        loop.close()
-        return result
-    except Exception as e:
-        logger.error(f"❌ Error in sync group check: {e}")
-        return "ไม่ทราบ"
+    """Legacy function to avoid undefined warnings"""
+    return "ไม่ทราบ"
 
 # ====== Bot Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
+    log_memory_usage("at start command")
+    
     welcome_message = (
         "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม\n\n"
         "📌 กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลังเครื่องหมาย : \n\n"
@@ -260,7 +242,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "อีเมล : \n"
         "ชื่อเทเลแกรม : \n"
         "@username Telegram : \n\n"
-        "⚠️ อย่าลืม! แค่เติมข้อมูลหลัง : เท่านั้น อย่าแก้ไขส่วนหน้า"
+        "⚠️ สำคัญ! ทุกช่องจำเป็นต้องกรอก ห้ามเว้นว่างแม้แต่ช่องเดียว"
     )
     
     keyboard = [[KeyboardButton("เริ่มต้นส่งข้อมูล ✅")]]
@@ -296,16 +278,30 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ชื่อ - นามสกุล : สมชาย ใจดี\n"
             "เบอร์โทร : 0812345678\n"
             "ธนาคาร : กสิกรไทย\n\n"
-            "⚠️ ห้ามเปลี่ยนคำหน้าเครื่องหมาย : แค่เติมข้อมูลหลัง : เท่านั้น"
+            "⚠️ ทุกช่องจำเป็นต้องกรอก ห้ามเว้นว่างแม้แต่ช่องเดียว"
         )
         return ASK_INFO
+    
+    logger.info(f"📋 Raw text received from user {user.id}:")
+    logger.info(f"Length: {len(text)} characters")
+    logger.info(f"Lines: {len(text.strip().splitlines())} total")
+    logger.info(f"Text content: {repr(text)}")
+    
+    # Show each line separately
+    lines = text.strip().splitlines()
+    for i, line in enumerate(lines):
+        logger.info(f"  Line {i+1}: {repr(line)} (has colon: {':' in line})")
     
     # Validate format - ต้องมี 7 บรรทัดที่มี :
     lines_with_colon = [line for line in text.strip().splitlines() if ':' in line]
     
+    logger.info(f"📊 Found {len(lines_with_colon)} lines with colon")
+    
     if len(lines_with_colon) != 7:
+        logger.warning(f"⚠️ Expected 7 lines with colon, got {len(lines_with_colon)}")
         await update.message.reply_text(
-            "❗ ข้อมูลไม่ครบ กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
+            f"❗ ข้อมูลไม่ครบ (พบ {len(lines_with_colon)}/7 ช่อง)\n"
+            "กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
             "📋 ก๊อปข้อความนี้:\n\n"
             "ชื่อ - นามสกุล : \n"
             "เบอร์โทร : \n"
@@ -320,21 +316,31 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Parse data simply - เอาค่าหลัง : ตรงๆ ตามลำดับ
     data_values = []
-    for line in lines_with_colon:
+    logger.info(f"📋 Processing {len(lines_with_colon)} lines for user {user.id}:")
+    
+    for i, line in enumerate(lines_with_colon):
         if ':' in line:
             value = line.split(':', 1)[1].strip()
             data_values.append(value)
+            logger.info(f"  Line {i+1}: '{line.split(':', 1)[0].strip()}' → '{value}'")
     
-    logger.info(f"📊 Parsed {len(data_values)} values from user {user.id}:")
+    logger.info(f"📊 Final parsed {len(data_values)} values from user {user.id}:")
     for i, value in enumerate(data_values):
-        logger.info(f"  {i+1}. '{value}'")
+        logger.info(f"  Position {i+1}: '{value}' (length: {len(value)})")
     
     # Check if any value is empty
-    if any(not value for value in data_values):
-        empty_positions = [i+1 for i, value in enumerate(data_values) if not value]
+    empty_positions = []
+    for i, value in enumerate(data_values):
+        if not value or value.strip() == "":
+            empty_positions.append(i+1)
+    
+    if empty_positions:
+        position_names = ["ชื่อ-นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username"]
+        missing_names = [position_names[i-1] for i in empty_positions if i <= len(position_names)]
+        
         await update.message.reply_text(
             f"❗ บางช่องเว้นว่าง กรุณากรอกให้ครบทุกช่อง\n"
-            f"ช่องที่เว้นว่าง: {', '.join(map(str, empty_positions))}\n\n"
+            f"ช่องที่เว้นว่าง: {', '.join(missing_names)}\n\n"
             "📋 ก๊อปข้อความนี้แล้วเติมข้อมูล:\n\n"
             "ชื่อ - นามสกุล : \n"
             "เบอร์โทร : \n"
@@ -344,6 +350,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ชื่อเทเลแกรม : \n"
             "@username Telegram : "
         )
+        logger.info(f"⚠️ Empty fields from user {user.id}: positions {empty_positions}")
         return ASK_INFO
 
     # Check group membership
@@ -442,25 +449,23 @@ def home():
 @flask_app.route("/health")
 def health_check():
     """Health check endpoint"""
-    bangkok_tz = pytz.timezone('Asia/Bangkok')
-    current_time = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
+    memory_mb = log_memory_usage("health check")
     
-    # Simple health check without memory monitoring
     health_status = "healthy"
     if len(pending_saves) > 10:
         health_status = "warning"
-    if len(failed_saves) > 5:
+    if len(failed_saves) > 5 or memory_mb > 1500:
         health_status = "critical"
     
     return {
         "status": health_status,
         "bot": "zombie-event-telegram-bot",
         "mode": "polling_improved",
-        "time": current_time,
+        "memory_mb": round(memory_mb, 2),
         "pending_saves": len(pending_saves),
         "failed_saves": len(failed_saves),
         "group_checking": bool(TELEGRAM_GROUP_ID),
-        "message": f"Bot running! Pending: {len(pending_saves)}, Failed: {len(failed_saves)}"
+        "message": f"Bot running! Memory: {memory_mb:.1f}MB, Pending: {len(pending_saves)}, Failed: {len(failed_saves)}"
     }
 
 @flask_app.route("/go")
@@ -536,7 +541,6 @@ if __name__ == "__main__":
         logger.info("💡 Please stop other instances or wait a moment")
         logger.info("🔧 Trying to clear webhook and restart...")
         
-        # Try to clear webhook and restart
         try:
             from telegram import Bot
             temp_bot = Bot(token=BOT_TOKEN)
