@@ -33,7 +33,6 @@ from telegram.error import Conflict, NetworkError, TelegramError
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.errors import HttpError
 
 # ====== Logging Setup ======
 logging.basicConfig(
@@ -267,14 +266,15 @@ def home():
 def health_check():
     """Health check endpoint"""
     import pytz
-    import psutil
+    import resource
     
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     current_time = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
-    # Memory check
-    process = psutil.Process()
-    memory_mb = process.memory_info().rss / 1024 / 1024
+    # Use resource module instead of psutil
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # On Linux, ru_maxrss is in KB
+    memory_mb = usage.ru_maxrss / 1024
     
     health_status = "healthy"
     if len(pending_saves) > 10:
