@@ -8,3 +8,4 @@ __pycache__/
 backups/
 backup_*.json
 *.log
+check_bot.py
