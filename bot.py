@@ -218,13 +218,13 @@ async def check_user_in_telegram_group(user_id: int) -> str:
         
         if chat_member.status in ['member', 'administrator', 'creator']:
             logger.info(f"✅ User {user_id} is in group: {chat_member.status}")
-            return "เข้าแล้ว"
+            return "✅ เข้าแล้ว"
         elif chat_member.status in ['left', 'kicked']:
             logger.info(f"❌ User {user_id} not in group: {chat_member.status}")
-            return "ยังไม่เข้า"
+            return "❌ ยังไม่เข้า"
         else:
             logger.info(f"❓ User {user_id} unknown status: {chat_member.status}")
-            return "ไม่ทราบ"
+            return "❓ ไม่ทราบ"
             
     except Exception as e:
         if "user not found" in str(e).lower():
@@ -300,34 +300,13 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_INFO
     
-    # Validate format
-    if text.count(":") < 5:
+    # Validate format - ต้องมี 7 บรรทัดที่มี :
+    lines_with_colon = [line for line in text.strip().splitlines() if ':' in line]
+    
+    if len(lines_with_colon) != 7:
         await update.message.reply_text(
-            "❗ ข้อมูลไม่ครบ กรุณาก๊อปข้อความจากด้านบนแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
-            "💡 ตัวอย่างที่ถูกต้อง:\n"
-            "ชื่อ - นามสกุล : สมชาย ใจดี\n"
-            "เบอร์โทร : 0812345678\n"
-            "ธนาคาร : กสิกรไทย\n"
-            "เลขบัญชี : 1234567890\n"
-            "อีเมล : somchai@email.com\n"
-            "ชื่อเทเลแกรม : สมชาย\n"
-            "@username Telegram : @somchai123"
-        )
-        return ASK_INFO
-    
-    # Check if customer modified the field names
-    expected_fields = ["ชื่อ - นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username telegram"]
-    lines_with_colon = [line.split(':', 1)[0].strip().lower() for line in text.strip().splitlines() if ':' in line]
-    
-    # Check for common field names
-    found_name = any("ชื่อ" in field and "นามสกุล" in field for field in lines_with_colon)
-    found_phone = any(any(word in field for word in ["เบอร์", "โทร", "ไทย"]) for field in lines_with_colon)
-    found_bank = any("ธนาคาร" in field for field in lines_with_colon)
-    
-    if not (found_name and found_phone and found_bank):
-        await update.message.reply_text(
-            "❗ รูปแบบไม่ถูกต้อง กรุณาใช้ template ที่กำหนดให้\n\n"
-            "📋 กรุณาก๊อปข้อความนี้แล้วเติมข้อมูล:\n\n"
+            "❗ ข้อมูลไม่ครบ กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
+            "📋 ก๊อปข้อความนี้:\n\n"
             "ชื่อ - นามสกุล : \n"
             "เบอร์โทร : \n"
             "ธนาคาร : \n"
@@ -338,73 +317,51 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ ห้ามแก้ไขคำหน้าเครื่องหมาย : แค่เติมข้อมูลหลัง : เท่านั้น"
         )
         return ASK_INFO
-
-    # Parse data with flexible field names
-    data = {}
-    for line in text.strip().splitlines():
+    
+    # Parse data simply - เอาค่าหลัง : ตรงๆ ตามลำดับ
+    data_values = []
+    for line in lines_with_colon:
         if ':' in line:
-            key, value = map(str.strip, line.split(':', 1))
-            
-            # Normalize field names - รองรับการพิมพ์หลากหลาย
-            key_lower = key.lower().replace(" ", "").replace("-", "")
-            
-            if "ชื่อ" in key and ("นามสกุล" in key or "surname" in key.lower()):
-                data["ชื่อ - นามสกุล"] = value
-            elif any(word in key.lower() for word in ["เบอร์", "phone", "tel", "โทร", "ไทย"]):
-                data["เบอร์โทร"] = value
-            elif "ธนาคาร" in key or "bank" in key.lower():
-                data["ธนาคาร"] = value
-            elif ("เลข" in key and "บัญชี" in key) or "account" in key.lower():
-                data["เลขบัญชี"] = value
-            elif "อีเมล" in key or "email" in key.lower():
-                data["อีเมล"] = value
-            elif "ชื่อ" in key and ("เทเลแกรม" in key or "telegram" in key.lower()) and "@" not in key:
-                data["ชื่อเทเลแกรม"] = value
-            elif "@" in key and ("username" in key.lower() or "telegram" in key):
-                data["@username telegram"] = value
-            else:
-                # Log unknown fields
-                logger.info(f"🤔 Unknown field from user {user.id}: '{key}' = '{value}'")
-
-    logger.info(f"📊 Parsed data from user {user.id}:")
-    for k, v in data.items():
-        logger.info(f"  ✅ {k}: '{v}'")
+            value = line.split(':', 1)[1].strip()
+            data_values.append(value)
     
-    # Debug: Show what fields we're looking for vs what we found
-    required_fields = ["ชื่อ - นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username telegram"]
-    logger.info(f"🔍 Required fields check for user {user.id}:")
+    logger.info(f"📊 Parsed {len(data_values)} values from user {user.id}:")
+    for i, value in enumerate(data_values):
+        logger.info(f"  {i+1}. '{value}'")
     
-    missing_fields = []
-    for field in required_fields:
-        if data.get(field):
-            logger.info(f"  ✅ {field}: OK")
-        else:
-            logger.info(f"  ❌ {field}: MISSING")
-            missing_fields.append(field)
-    
-    if missing_fields:
+    # Check if any value is empty
+    if any(not value for value in data_values):
+        empty_positions = [i+1 for i, value in enumerate(data_values) if not value]
         await update.message.reply_text(
-            f"❗ ข้อมูลไม่ครบ กรุณากรอกให้ครบทุกช่อง\nข้อมูลที่ขาด: {', '.join(missing_fields)}"
+            f"❗ บางช่องเว้นว่าง กรุณากรอกให้ครบทุกช่อง\n"
+            f"ช่องที่เว้นว่าง: {', '.join(map(str, empty_positions))}\n\n"
+            "📋 ก๊อปข้อความนี้แล้วเติมข้อมูล:\n\n"
+            "ชื่อ - นามสกุล : \n"
+            "เบอร์โทร : \n"
+            "ธนาคาร : \n"
+            "เลขบัญชี : \n"
+            "อีเมล : \n"
+            "ชื่อเทเลแกรม : \n"
+            "@username Telegram : "
         )
-        logger.info(f"⚠️ Missing fields from user {user.id}: {missing_fields}")
         return ASK_INFO
 
     # Check group membership
     group_status = check_user_in_group_sync(user.id)
     logger.info(f"👥 Group status for user {user.id}: {group_status}")
     
-    # Prepare data for Google Sheets
+    # Prepare data for Google Sheets - ใช้ค่าตามลำดับที่ลูกค้าส่งมา
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
     user_data = [
-        data.get("ชื่อ - นามสกุล", ""),
-        data.get("เบอร์โทร", ""),
-        data.get("ธนาคาร", ""),
-        data.get("เลขบัญชี", ""),
-        data.get("อีเมล", ""),
-        data.get("ชื่อเทเลแกรม", ""),
-        data.get("@username telegram", ""),
+        data_values[0],  # ชื่อ - นามสกุล
+        data_values[1],  # เบอร์โทร  
+        data_values[2],  # ธนาคาร
+        data_values[3],  # เลขบัญชี
+        data_values[4],  # อีเมล
+        data_values[5],  # ชื่อเทเลแกรม
+        data_values[6],  # @username telegram
         user.username or "ไม่มี",
         str(user.id),
         group_status,
@@ -412,6 +369,12 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "PENDING",
         ""
     ]
+    
+    # Debug log
+    logger.info(f"💾 Saving data for user {user.id}:")
+    field_names = ["ชื่อ", "เบอร์", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อTG", "@username", "TG_Auto", "UserID", "ชนิดไลน์", "วันที่", "บ้านรับ", "บ้านไปแล้ว"]
+    for i, (field, value) in enumerate(zip(field_names, user_data)):
+        logger.info(f"  Col{i+1} {field}: '{value}'")
     
     # Add to pending list
     pending_saves.append(user_data)
@@ -433,7 +396,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     confirm_message = (
-        f"✅ ขอบคุณ 🙏🏻 {data.get('ชื่อ - นามสกุล', 'คุณ')} สำหรับการยืนยันตัวตน\n\n"
+        f"✅ ขอบคุณ 🙏🏻 {data_values[0]} สำหรับการยืนยันตัวตน\n\n"
         f"สถานะ: {group_status}\n"
         "👑 ขั้นตอนถัดไป:\n"
         "1️⃣ แคปหน้าจอข้อความนี้\n"
@@ -554,6 +517,12 @@ if __name__ == "__main__":
     logger.info(f"👥 Group checking: {'Enabled' if TELEGRAM_GROUP_ID else 'Disabled'}")
     
     try:
+        # Clear any existing webhook before starting polling
+        from telegram import Bot
+        temp_bot = Bot(token=BOT_TOKEN)
+        temp_bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Cleared webhook before starting polling")
+        
         # Start polling with proper error handling
         app.run_polling(
             drop_pending_updates=True,
@@ -565,6 +534,26 @@ if __name__ == "__main__":
     except Conflict:
         logger.error("❌ Another instance is already running!")
         logger.info("💡 Please stop other instances or wait a moment")
+        logger.info("🔧 Trying to clear webhook and restart...")
+        
+        # Try to clear webhook and restart
+        try:
+            from telegram import Bot
+            temp_bot = Bot(token=BOT_TOKEN)
+            temp_bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook cleared, waiting 10 seconds...")
+            time.sleep(10)
+            
+            # Try again
+            app.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False,
+                poll_interval=1.0,
+                timeout=10
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to restart: {e}")
     except Exception as e:
         logger.error(f"❌ Bot error: {e}")
     finally:
