@@ -5,6 +5,11 @@ from datetime import datetime
 from threading import Thread
 from flask import Flask, request, redirect
 from flask_cors import CORS
+import time
+import asyncio
+import logging
+import signal
+import sys
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,31 +29,103 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
+from telegram.error import Conflict, NetworkError, TelegramError
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.errors import HttpError
+
+# ====== Logging Setup ======
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ====== Graceful Shutdown Handler ======
+class GracefulShutdown:
+    shutdown = False
+    
+    @classmethod
+    def signal_handler(cls, sig, frame):
+        logger.info('Graceful shutdown initiated...')
+        cls.shutdown = True
+        sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, GracefulShutdown.signal_handler)
+signal.signal(signal.SIGTERM, GracefulShutdown.signal_handler)
 
 # ====== Google Sheet Setup ======
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
-if not creds_b64:
-    raise ValueError("Environment variable GOOGLE_CREDS_JSON not found")
+def get_google_sheet():
+    """สร้าง connection ใหม่ทุกครั้ง"""
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
+        if not creds_b64:
+            raise ValueError("Environment variable GOOGLE_CREDS_JSON not found")
 
-creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
-credentials_info = json.loads(creds_json_str)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
-client = gspread.authorize(creds)
-sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").worksheet("ข้อมูลลูกค้า")
+        creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
+        credentials_info = json.loads(creds_json_str)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").worksheet("ข้อมูลลูกค้า")
+        return sheet
+    except Exception as e:
+        logger.error(f"Google Sheets connection error: {e}")
+        return None
 
 # ====== Bot Config ======
 ASK_INFO = range(1)
-GROUP_ID = -1002561643127  # เปลี่ยนเป็น group id ของคุณ
+GROUP_ID = -1002561643127
+
+# Global storage for pending saves
+pending_saves = []
+failed_saves = []
 
 def build_redirect_url(house_key, user_id):
     return f"https://zombie-event-telegram-bot.onrender.com/go?house={house_key}&uid={user_id}"
+
+def safe_append_row(data, max_retries=3):
+    """บันทึกข้อมูลพร้อม retry ถ้าเกิด error"""
+    for attempt in range(max_retries):
+        try:
+            sheet = get_google_sheet()
+            if sheet:
+                sheet.append_row(data)
+                logger.info(f"✅ บันทึกข้อมูลสำเร็จ")
+                return True
+        except Exception as e:
+            if hasattr(e, 'resp') and e.resp.status == 429:
+                wait_time = (attempt + 1) * 5
+                logger.warning(f"⏳ Rate limit! รอ {wait_time} วินาที...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Error attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    # บันทึก backup
+                    backup_data = {
+                        "timestamp": datetime.now().isoformat(),
+                        "data": data,
+                        "error": str(e)
+                    }
+                    failed_saves.append(backup_data)
+                    
+                    # บันทึกลงไฟล์
+                    try:
+                        with open("backup_failed_saves.json", "a", encoding='utf-8') as f:
+                            json.dump(backup_data, f, ensure_ascii=False)
+                            f.write("\n")
+                        logger.info("💾 บันทึกไว้ใน backup file")
+                    except:
+                        pass
+        
+        time.sleep(1)
+    
+    return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
@@ -64,7 +141,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     keyboard = [[KeyboardButton("เริ่มต้นส่งข้อมูล ✅")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(welcome_message, reply_markup=reply_markup)
+    
+    try:
+        await update.message.reply_text(welcome_message, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error in start: {e}")
+    
     return ASK_INFO
 
 async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,8 +209,8 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # เพิ่มแถวใหม่ทุกครั้ง (ไม่ตรวจสอบว่ามีอยู่แล้วหรือไม่)
-    sheet.append_row([
+    # เตรียมข้อมูลสำหรับบันทึก
+    user_data = [
         data.get("ชื่อ - นามสกุล", ""),
         data.get("เบอร์โทร", ""),
         data.get("ธนาคาร", ""),
@@ -140,18 +222,40 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         str(user_id),
         status_text,
         now,
-        "PENDING",  # บ้านที่รับเครดิตฟรี (เริ่มต้นเป็น PENDING)
-        ""  # บ้านที่เคยกดเข้าไปดู
-    ])
+        "PENDING",
+        ""
+    ]
+    
+    # เพิ่มใน pending list ก่อน
+    pending_saves.append(user_data)
+    
+    # พยายามบันทึก
+    success = safe_append_row(user_data)
+    
+    # ถ้าสำเร็จ ลบออกจาก pending
+    if success and user_data in pending_saves:
+        pending_saves.remove(user_data)
+    
+    # แจ้งเตือนถ้ามีข้อมูลค้าง
+    if len(pending_saves) > 0:
+        logger.info(f"⚠️ มีข้อมูลรอบันทึก {len(pending_saves)} รายการ")
 
-    await update.message.reply_text(confirm_message, parse_mode="Markdown", reply_markup=reply_markup)
+    try:
+        await update.message.reply_text(confirm_message, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error sending confirm message: {e}")
+    
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
     return ConversationHandler.END
 
-# ====== Flask App สำหรับ log_click และ health check ======
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    logger.error(f"Exception while handling an update: {context.error}")
+
+# ====== Flask App ======
 flask_app = Flask(__name__)
 CORS(flask_app)
 
@@ -161,15 +265,31 @@ def home():
 
 @flask_app.route("/health")
 def health_check():
-    """Health check endpoint สำหรับ UptimeRobot"""
+    """Health check endpoint"""
     import pytz
+    import psutil
+    
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     current_time = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Memory check
+    process = psutil.Process()
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    
+    health_status = "healthy"
+    if len(pending_saves) > 10:
+        health_status = "warning"
+    if len(failed_saves) > 5:
+        health_status = "critical"
+    
     return {
-        "status": "healthy",
+        "status": health_status,
         "bot": "zombie-event-telegram-bot",
         "time": current_time,
-        "message": "Bot is running normally! 🟢"
+        "memory_mb": round(memory_mb, 2),
+        "pending_saves": len(pending_saves),
+        "failed_saves": len(failed_saves),
+        "message": f"Bot is running! Pending: {len(pending_saves)}, Failed: {len(failed_saves)}"
     }
 
 @flask_app.route("/go")
@@ -199,100 +319,42 @@ def go():
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
     try:
-        # ค้นหา user_id ทั้งหมดใน sheet
-        all_cells = sheet.findall(str(uid))
-        if all_cells:
-            # หาแถวล่าสุด
-            last_cell = all_cells[-1]
-            last_row = last_cell.row
-            print(f"✅ พบ user_id {uid} ที่แถว {last_row} (แถวล่าสุด)")
-            
-            # รวบรวมบ้านที่เคยกดจากแถวก่อนหน้า (ไม่รวมแถวปัจจุบัน)
-            all_houses = []
-            
-            # ดึงบ้านจากแถวก่อนหน้าทั้งหมด
-            for i, cell in enumerate(all_cells[:-1]):  # ไม่รวมแถวล่าสุด
-                row = cell.row
-                # บ้านที่รับเครดิตฟรี (คอลัมน์ 12)
-                house_credit = sheet.cell(row, 12).value
-                if house_credit and house_credit != "PENDING" and house_credit not in all_houses:
-                    all_houses.append(house_credit)
-            
-            # เพิ่มบ้านที่กดครั้งนี้
-            if house not in all_houses:
-                all_houses.append(house)
-            
-            # สร้าง string ของบ้านทั้งหมด
-            all_houses_str = ",".join(all_houses)
-            
-            # อัพเดทบ้านที่รับเครดิตฟรี (คอลัมน์ 12)
-            current_house = sheet.cell(last_row, 12).value
-            if current_house == "PENDING":
-                sheet.update_cell(last_row, 12, house)
-                print(f"🏠 อัพเดทบ้านที่รับเครดิตฟรี: {house}")
-            
-            # อัพเดทรายการบ้านที่เคยกดสะสม (คอลัมน์ 13)
-            sheet.update_cell(last_row, 13, all_houses_str)
-            print(f"📝 อัพเดทรายการบ้านสะสม: {all_houses_str}")
-            
-        else:
-            print(f"❌ ไม่พบ user_id {uid} ในชีต")
-            
+        sheet = get_google_sheet()
+        if sheet:
+            # ค้นหา user_id ทั้งหมดใน sheet
+            all_cells = sheet.findall(str(uid))
+            if all_cells:
+                # หาแถวล่าสุด
+                last_cell = all_cells[-1]
+                last_row = last_cell.row
+                logger.info(f"✅ พบ user_id {uid} ที่แถว {last_row}")
+                
+                # อัพเดทข้อมูล
+                try:
+                    current_house = sheet.cell(last_row, 12).value
+                    if current_house == "PENDING":
+                        sheet.update_cell(last_row, 12, house)
+                        logger.info(f"🏠 อัพเดทบ้านที่รับเครดิตฟรี: {house}")
+                except Exception as e:
+                    logger.error(f"Error updating: {e}")
     except Exception as e:
-        print(f"❌ Error updating sheet: {e}")
+        logger.error(f"❌ Error in go route: {e}")
     
-    # Redirect ไป LINE
-    print(f"↗️ Redirect {uid} ไปยัง {house}: {link}")
+    logger.info(f"↗️ Redirect {uid} ไปยัง {house}: {link}")
     return redirect(link, code=302)
 
-@flask_app.route("/log_click", methods=["POST"])
-def log_click():
-    try:
-        data = request.get_json()
-        print("📥 ได้รับข้อมูลจาก Worker:", data)
-
-        house = data.get("house", "").upper()
-        user_id = str(data.get("uid"))
-        time = data.get("time", datetime.utcnow().isoformat())
-
-        if not house or not user_id:
-            print("⚠️ house หรือ uid หายไป")
-            return 'invalid', 400
-
-        try:
-            cell = sheet.find(user_id)
-        except Exception as e:
-            print(f"❌ หา user_id {user_id} ไม่เจอในชีต")
-            return 'not found', 404
-
-        row = cell.row
-        print(f"✅ เจอ user_id ที่ row {row}")
-
-        sheet.update_cell(row, 12, house)
-        print(f"🏠 อัปเดตคอลัมน์ L (12): {house}")
-
-        current = sheet.cell(row, 13).value or ""
-        if house not in current:
-            updated = f"{current},{house}" if current else house
-            sheet.update_cell(row, 13, updated)
-            print(f"🧩 เพิ่มบ้าน {house} ในคอลัมน์ M (13): {updated}")
-        else:
-            print(f"🔁 บ้าน {house} เคยกดแล้ว ไม่อัปเดตซ้ำ")
-
-        return '', 204
-
-    except Exception as e:
-        print("❌ ERROR ใน log_click:", e)
-        return 'error', 500
-
-# ====== Main function สำหรับ Render ======
+# ====== Main function ======
 if __name__ == "__main__":
     # Initialize bot
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise ValueError("Environment variable BOT_TOKEN not found")
 
+    # Create application with conflict handling
     app = ApplicationBuilder().token(bot_token).build()
+    
+    # Add error handler
+    app.add_error_handler(error_handler)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -306,8 +368,22 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Start bot
-    print("🤖 Bot is starting...")
-    print("🌐 Health check available at: /health")
-    print("🔗 Redirect handler available at: /go")
-    app.run_polling(drop_pending_updates=True)
+    # Start bot with proper error handling
+    logger.info("🤖 Bot is starting...")
+    logger.info("🌐 Health check available at: /health")
+    logger.info("🔗 Redirect handler available at: /go")
+    
+    try:
+        # Use drop_pending_updates to clear old updates
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
+    except Conflict:
+        logger.error("❌ Another instance is already running!")
+        logger.info("💡 Please stop other instances or wait a moment")
+    except Exception as e:
+        logger.error(f"❌ Bot error: {e}")
+    finally:
+        logger.info("Bot stopped")
