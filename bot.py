@@ -418,7 +418,7 @@ def retry_failed_saves():
             time.sleep(60)
 
 # ====== Main ======
-async def main():
+def main():
     # Start background task
     retry_thread = Thread(target=retry_failed_saves, daemon=True)
     retry_thread.start()
@@ -473,18 +473,10 @@ async def main():
         logger.info("PERFORMANCE: Optimized for 400+ users")
         logger.info("Health check: /health")
         
-        # Delete webhook before starting polling
-        logger.info("🔧 Deleting webhook before starting polling...")
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook deleted successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to delete webhook: {type(e).__name__}")
-        
-        # Run bot
+        # Run bot with drop_pending_updates to clear webhook conflicts
         logger.info("🤖 Starting bot with polling...")
         app.run_polling(
-            drop_pending_updates=True,
+            drop_pending_updates=True,  # This will clear webhook automatically
             allowed_updates=Update.ALL_TYPES
         )
         
@@ -499,4 +491,4 @@ async def main():
         logger.info("Bot shutdown complete")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
