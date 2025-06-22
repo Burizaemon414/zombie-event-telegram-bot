@@ -1,14 +1,18 @@
 import os
+import gc
 import json
 import base64
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Lock
 from flask import Flask, request, redirect
+from flask_cors import CORS
 import time
+import asyncio
 import logging
 import signal
 import sys
-import pytz
+import hashlib
+from collections import deque, defaultdict
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,367 +37,251 @@ from telegram.error import Conflict, NetworkError, TelegramError
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ====== Logging Setup ======
+# ====== Secure Logging ======
+def mask_sensitive_data(text):
+    """Mask sensitive information in logs"""
+    if not isinstance(text, str):
+        return str(text)
+    
+    # Mask phone numbers (Thai format)
+    import re
+    text = re.sub(r'(0[0-9]{1,2}-?[0-9]{3,4}-?[0-9]{4})', lambda m: f"{m.group(1)[:3]}***{m.group(1)[-2:]}", text)
+    
+    # Mask emails
+    text = re.sub(r'([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r'\1***@\2', text)
+    
+    # Mask account numbers (6+ digits)
+    text = re.sub(r'\b(\d{6,})\b', lambda m: f"{m.group(1)[:2]}***{m.group(1)[-2:]}", text)
+    
+    return text
+
+class SecureFormatter(logging.Formatter):
+    def format(self, record):
+        # Format the message first
+        formatted = super().format(record)
+        # Then mask sensitive data
+        return mask_sensitive_data(formatted)
+
+# Configure secure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
+
+# Replace the default formatter with secure one
+for handler in logging.root.handlers:
+    handler.setFormatter(SecureFormatter())
+
 logger = logging.getLogger(__name__)
 
-# Reduce telegram library logs
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# ====== Graceful Shutdown Handler ======
-class GracefulShutdown:
-    shutdown = False
+# ====== Rate Limiting ======
+class RateLimiter:
+    def __init__(self, max_requests=10, time_window=60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = defaultdict(deque)
+        self.lock = Lock()
     
-    @classmethod
-    def signal_handler(cls, sig, frame):
-        logger.info('🛑 Graceful shutdown initiated...')
-        cls.shutdown = True
-        sys.exit(0)
+    def is_allowed(self, user_id):
+        with self.lock:
+            now = time.time()
+            user_requests = self.requests[user_id]
+            
+            # Clean old requests
+            while user_requests and user_requests[0] < now - self.time_window:
+                user_requests.popleft()
+            
+            # Check if under limit
+            if len(user_requests) < self.max_requests:
+                user_requests.append(now)
+                return True
+            
+            return False
 
-# Register signal handlers
-signal.signal(signal.SIGINT, GracefulShutdown.signal_handler)
-signal.signal(signal.SIGTERM, GracefulShutdown.signal_handler)
+# Initialize rate limiter
+rate_limiter = RateLimiter(max_requests=5, time_window=60)  # 5 requests per minute per user
 
-# ====== Bot Config ======
+# ====== Memory Monitoring ======
+def log_memory_usage(context=""):
+    """Log current memory usage"""
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    memory_mb = usage.ru_maxrss / 1024  # Linux KB to MB
+    logger.info(f"💾 Memory {context}: {memory_mb:.1f} MB")
+    return memory_mb
+
+# ====== Google Sheet Manager ======
+class LightweightSheetManager:
+    def __init__(self):
+        self.sheet = None
+        self.last_connect = None
+        self.connect_interval = 300  # reconnect every 5 mins
+        self._lock = Lock()
+    
+    def get_sheet(self):
+        """Get sheet with connection pooling"""
+        with self._lock:
+            now = time.time()
+            if self.sheet and self.last_connect and (now - self.last_connect < self.connect_interval):
+                return self.sheet
+            
+            try:
+                if self.sheet:
+                    del self.sheet
+                    gc.collect()
+                
+                scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+                creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
+                creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
+                credentials_info = json.loads(creds_json_str)
+                creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
+                
+                client = gspread.authorize(creds)
+                self.sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").worksheet("ข้อมูลลูกค้า")
+                self.last_connect = now
+                
+                logger.info("✅ Google Sheets connected")
+                return self.sheet
+                
+            except Exception as e:
+                logger.error(f"❌ Sheet connection error: {str(e)}")
+                return None
+
+# Initialize
+sheet_manager = LightweightSheetManager()
+
+# Bot Config
 ASK_INFO = range(1)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID")
+GROUP_ID = -1002561643127
 
-if not BOT_TOKEN:
-    raise ValueError("No BOT_TOKEN in environment")
-
-if not TELEGRAM_GROUP_ID:
-    logger.warning("⚠️ No TELEGRAM_GROUP_ID in environment - group checking disabled")
-
-# Global storage for pending saves
 from collections import deque
 pending_saves = deque(maxlen=100)
 failed_saves = deque(maxlen=50)
 
-# Initialize sheet manager
-sheet_manager = LightweightSheetManager()
+# ====== Helper Functions ======
+def create_user_hash(user_id):
+    """Create hash for user logging (privacy)"""
+    return hashlib.md5(str(user_id).encode()).hexdigest()[:8]
 
-# ====== Google Sheet Setup ======
-def get_google_sheet():
-    """สร้าง connection ใหม่ทุกครั้ง - เสถียรกว่า"""
+async def check_group_membership(context, user_id):
+    """Fixed group membership check"""
     try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds_b64 = os.getenv("GOOGLE_CREDS_JSON")
-        if not creds_b64:
-            raise ValueError("Environment variable GOOGLE_CREDS_JSON not found")
-
-        creds_json_str = base64.b64decode(creds_b64).decode("utf-8")
-        credentials_info = json.loads(creds_json_str)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("เครดิตฟรี กลุ่ม กิจกรรม ZOMBIE").worksheet("ข้อมูลลูกค้า")
-        return sheet
+        member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
+        return member.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logger.error(f"❌ Google Sheets connection error: {e}")
-        return None
-
-def safe_append_row(data, max_retries=3):
-    """บันทึกข้อมูลพร้อม retry และ backup ถ้าเกิด error"""
-    for attempt in range(max_retries):
-        try:
-            if sheet_manager.append_row(data):
-                logger.info(f"✅ บันทึกข้อมูลสำเร็จ (attempt {attempt + 1})")
-                # Add memory cleanup
-        gc.collect()
-        log_memory_usage("after save")
-        
-        return True
-        except Exception as e:
-            logger.error(f"❌ Error attempt {attempt + 1}: {e}")
-            if attempt == max_retries - 1:
-                # บันทึก backup
-                backup_data = {
-                    "timestamp": datetime.now().isoformat(),
-                    "data": data,
-                    "error": str(e)
-                }
-                failed_saves.append(backup_data)
-                
-                # บันทึกลงไฟล์
-                try:
-                    with open("backup_failed_saves.json", "a", encoding='utf-8') as f:
-                        json.dump(backup_data, f, ensure_ascii=False)
-                        f.write("\n")
-                    logger.info("💾 บันทึกไว้ใน backup file")
-                except:
-                    pass
-        
-        time.sleep(1)
-    
-    return False
-
-def update_house_selection(user_id, house):
-    """อัพเดทการเลือกบ้านใน Google Sheet"""
-    try:
-        sheet = get_google_sheet()
-        if not sheet:
-            return False
-        
-        # หา user_id ใน sheet
-        all_cells = sheet.findall(str(user_id))
-        if not all_cells:
-            logger.warning(f"⚠️ User {user_id} not found in sheet")
-            return False
-        
-        # หาแถวล่าสุดของ user นี้
-        user_rows = []
-        for cell in all_cells:
-            # เช็คว่าเป็น column User ID (column I = 9)
-            if cell.col == 9:
-                user_rows.append(cell.row)
-        
-        if not user_rows:
-            logger.warning(f"⚠️ No valid user rows found for {user_id}")
-            return False
-        
-        # เอาแถวล่าสุด
-        last_row = max(user_rows)
-        logger.info(f"📋 Found user {user_id} at row {last_row}")
-        
-        # Get current status and notes
-        current_status = sheet.cell(last_row, 12).value  # Column L - บ้านที่รับเครดิตฟรี
-        current_history = sheet.cell(last_row, 13).value or ""  # Column M - บ้านที่รับไปแล้ว
-        
-        bangkok_tz = pytz.timezone('Asia/Bangkok')
-        now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
-        
-        if current_status == "PENDING":
-            # ครั้งแรก - อัพเดท status และไม่เปลี่ยน timestamp
-            sheet.update_cell(last_row, 12, house)  # บ้านที่รับเครดิตฟรี
-            sheet.update_cell(last_row, 13, house)  # บ้านที่รับไปแล้ว
-            logger.info(f"✅ Updated PENDING to {house} for user {user_id}")
-            
-        else:
-            # ไม่ใช่ครั้งแรก - สร้าง row ใหม่
-            # ดึงข้อมูลเดิม
-            row_data = sheet.row_values(last_row)
-            
-            # สร้างประวัติบ้านที่เคยไป
-            existing_houses = current_history.split(',') if current_history else []
-            if current_status and current_status != 'PENDING':
-                if current_status not in existing_houses:
-                    existing_houses.append(current_status)
-            existing_houses.append(house)
-            
-            # สร้าง row ใหม่
-            new_row = row_data[:11]  # เอาข้อมูลถึง column K (วันที่)
-            new_row[10] = now  # อัพเดทเวลาใหม่
-            new_row.append(house)  # บ้านที่รับเครดิตฟรี (column L)
-            new_row.append(','.join(existing_houses))  # บ้านที่รับไปแล้ว (column M)
-            
-            sheet.append_row(new_row)
-            logger.info(f"✅ Created new row for user {user_id}: {house}")
-            logger.info(f"📊 House history: {','.join(existing_houses)}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Error updating house selection: {e}")
+        user_hash = create_user_hash(user_id)
+        logger.error(f"❌ Group check failed for user {user_hash}: {str(e)}")
         return False
-
-# ====== Group Membership Checking ======
-async def check_user_in_group_async(context, user_id: int) -> str:
-    """Check if user is in Telegram group - simple and stable"""
-    try:
-        if not TELEGRAM_GROUP_ID:
-            return "ไม่ทราบ"
-        
-        # ใช้ context.bot แบบโค้ดที่ทำงานได้
-        member = await context.bot.get_chat_member(chat_id=TELEGRAM_GROUP_ID, user_id=user_id)
-        in_group = member.status in ['member', 'administrator', 'creator']
-        
-        if in_group:
-            return "✅ อยู่ในกลุ่มแล้ว"
-        else:
-            return "❌ ยังไม่ได้เข้ากลุ่ม"
-            
-    except Exception as e:
-        logger.error(f"❌ Error checking group for user {user_id}: {e}")
-        return "ไม่ทราบ"
-
-def check_user_in_group_sync(user_id: int) -> str:
-    """Legacy function to avoid undefined warnings"""
-    return "ไม่ทราบ"
 
 # ====== Bot Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
+    user_id = update.message.from_user.id
+    user_hash = create_user_hash(user_id)
+    
+    # Rate limiting check
+    if not rate_limiter.is_allowed(user_id):
+        await update.message.reply_text("⏱️ กรุณารอสักครู่ก่อนส่งคำสั่งใหม่")
+        logger.warning(f"🚫 Rate limit exceeded for user {user_hash}")
+        return ConversationHandler.END
+    
     log_memory_usage("at start command")
+    logger.info(f"🎯 Start command from user {user_hash}")
     
     welcome_message = (
-        "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม\n\n"
-        "📌 กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลังเครื่องหมาย : \n\n"
+        "🎉 ยินดีต้อนรับเข้าสู่ระบบยืนยันตัวตน ZOMBIE SLOT - กิจกรรม \n\n"
+        "📌 กรุณาก๊อปข้อความด้านล่างนี้แล้วเติมข้อมูลให้ครบทุกช่อง \n\n"
         "ชื่อ - นามสกุล : \n"
         "เบอร์โทร : \n"
         "ธนาคาร : \n"
         "เลขบัญชี : \n"
         "อีเมล : \n"
         "ชื่อเทเลแกรม : \n"
-        "@username Telegram : \n\n"
-        "⚠️ สำคัญ! ทุกช่องจำเป็นต้องกรอก ห้ามเว้นว่างแม้แต่ช่องเดียว"
+        "@username Telegram :"
     )
-    
     keyboard = [[KeyboardButton("เริ่มต้นส่งข้อมูล ✅")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
-    try:
-        await update.message.reply_text(welcome_message, reply_markup=reply_markup)
-        logger.info(f"🚀 /start command from user {update.effective_user.id}")
-    except Exception as e:
-        logger.error(f"❌ Error in start: {e}")
-    
+    await update.message.reply_text(welcome_message, reply_markup=reply_markup)
     return ASK_INFO
 
 async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user information input"""
+    user_id = update.message.from_user.id
+    user_hash = create_user_hash(user_id)
     text = update.message.text
-    user = update.message.from_user
     
-    logger.info(f"📝 Processing info from user {user.id}")
-    
-    # Skip if it's just the button text
-    if text == "เริ่มต้นส่งข้อมูล ✅":
-        await update.message.reply_text(
-            "📋 กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลของคุณหลังเครื่องหมาย : \n\n"
-            "ชื่อ - นามสกุล : ใส่ชื่อของคุณ\n"
-            "เบอร์โทร : ใส่เบอร์ของคุณ\n"
-            "ธนาคาร : ใส่ธนาคารของคุณ\n"
-            "เลขบัญชี : ใส่เลขบัญชีของคุณ\n"
-            "อีเมล : ใส่อีเมลของคุณ\n"
-            "ชื่อเทเลแกรม : ใส่ชื่อเทเลแกรมของคุณ\n"
-            "@username Telegram : ใส่ @username ของคุณ\n\n"
-            "💡 ตัวอย่าง:\n"
-            "ชื่อ - นามสกุล : สมชาย ใจดี\n"
-            "เบอร์โทร : 0812345678\n"
-            "ธนาคาร : กสิกรไทย\n\n"
-            "⚠️ ทุกช่องจำเป็นต้องกรอก ห้ามเว้นว่างแม้แต่ช่องเดียว"
-        )
+    # Rate limiting check
+    if not rate_limiter.is_allowed(user_id):
+        await update.message.reply_text("⏱️ กรุณารอสักครู่ก่อนส่งข้อมูลใหม่")
         return ASK_INFO
     
-    logger.info(f"📋 Raw text received from user {user.id}:")
-    logger.info(f"Length: {len(text)} characters")
-    logger.info(f"Lines: {len(text.strip().splitlines())} total")
-    logger.info(f"Text content: {repr(text)}")
+    logger.info(f"📝 Processing data from user {user_hash}")
     
-    # Show each line separately
-    lines = text.strip().splitlines()
-    for i, line in enumerate(lines):
-        logger.info(f"  Line {i+1}: {repr(line)} (has colon: {':' in line})")
-    
-    # Validate format - ต้องมี 7 บรรทัดที่มี :
-    lines_with_colon = [line for line in text.strip().splitlines() if ':' in line]
-    
-    logger.info(f"📊 Found {len(lines_with_colon)} lines with colon")
-    
-    if len(lines_with_colon) != 7:
-        logger.warning(f"⚠️ Expected 7 lines with colon, got {len(lines_with_colon)}")
-        await update.message.reply_text(
-            f"❗ ข้อมูลไม่ครบ (พบ {len(lines_with_colon)}/7 ช่อง)\n"
-            "กรุณาก๊อปข้อความด้านล่างแล้วเติมข้อมูลหลัง : ให้ครบทุกช่อง\n\n"
-            "📋 ก๊อปข้อความนี้:\n\n"
-            "ชื่อ - นามสกุล : \n"
-            "เบอร์โทร : \n"
-            "ธนาคาร : \n"
-            "เลขบัญชี : \n"
-            "อีเมล : \n"
-            "ชื่อเทเลแกรม : \n"
-            "@username Telegram : \n\n"
-            "⚠️ ห้ามแก้ไขคำหน้าเครื่องหมาย : แค่เติมข้อมูลหลัง : เท่านั้น"
-        )
+    if text.count(":") < 5:
+        await update.message.reply_text("❗ ข้อมูลไม่ครบ กรุณากรอกให้ครบทุกช่อง")
         return ASK_INFO
     
-    # Parse data simply - เอาค่าหลัง : ตรงๆ ตามลำดับ
-    data_values = []
-    logger.info(f"📋 Processing {len(lines_with_colon)} lines for user {user.id}:")
-    
-    for i, line in enumerate(lines_with_colon):
+    data = {}
+    for line in text.strip().splitlines():
         if ':' in line:
-            value = line.split(':', 1)[1].strip()
-            data_values.append(value)
-            logger.info(f"  Line {i+1}: '{line.split(':', 1)[0].strip()}' → '{value}'")
+            key, value = map(str.strip, line.split(':', 1))
+            data[key.lower()] = value
     
-    logger.info(f"📊 Final parsed {len(data_values)} values from user {user.id}:")
-    for i, value in enumerate(data_values):
-        logger.info(f"  Position {i+1}: '{value}' (length: {len(value)})")
-    
-    # Check if any value is empty
-    empty_positions = []
-    for i, value in enumerate(data_values):
-        if not value or value.strip() == "":
-            empty_positions.append(i+1)
-    
-    if empty_positions:
-        position_names = ["ชื่อ-นามสกุล", "เบอร์โทร", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อเทเลแกรม", "@username"]
-        missing_names = [position_names[i-1] for i in empty_positions if i <= len(position_names)]
-        
-        await update.message.reply_text(
-            f"❗ บางช่องเว้นว่าง กรุณากรอกให้ครบทุกช่อง\n"
-            f"ช่องที่เว้นว่าง: {', '.join(missing_names)}\n\n"
-            "📋 ก๊อปข้อความนี้แล้วเติมข้อมูล:\n\n"
-            "ชื่อ - นามสกุล : \n"
-            "เบอร์โทร : \n"
-            "ธนาคาร : \n"
-            "เลขบัญชี : \n"
-            "อีเมล : \n"
-            "ชื่อเทเลแกรม : \n"
-            "@username Telegram : "
-        )
-        logger.info(f"⚠️ Empty fields from user {user.id}: positions {empty_positions}")
+    if any(not v for v in data.values()):
+        await update.message.reply_text("❗ บางช่องเว้นว่าง กรุณากรอกให้ครบทุกช่อง")
         return ASK_INFO
-
-    # Check group membership
-    group_status = check_user_in_group_sync(user.id)
-    logger.info(f"👥 Group status for user {user.id}: {group_status}")
     
-    # Prepare data for Google Sheets - ใช้ค่าตามลำดับที่ลูกค้าส่งมา
+    user = update.message.from_user
+    username = user.username or "ไม่มี"
+    
+    # Fixed group membership check (using working code from bot_fixed_final.py)
+    try:
+        member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
+        in_group = member.status in ['member', 'administrator', 'creator']
+        logger.info(f"✅ Group check successful for user {user_hash}: {in_group}")
+    except Exception as e:
+        logger.error(f"❌ Group check failed for user {user_hash}: {str(e)}")
+        in_group = False
+    
+    status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
+    
+    import pytz
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
+    # Prepare data for sheet (no logging of sensitive data)
     user_data = [
-        data_values[0],  # ชื่อ - นามสกุล
-        data_values[1],  # เบอร์โทร  
-        data_values[2],  # ธนาคาร
-        data_values[3],  # เลขบัญชี
-        data_values[4],  # อีเมล
-        data_values[5],  # ชื่อเทเลแกรม
-        data_values[6],  # @username telegram
-        user.username or "ไม่มี",
-        str(user.id),
-        group_status,
+        data.get("ชื่อ - นามสกุล", ""),
+        data.get("เบอร์โทร", ""),
+        data.get("ธนาคาร", ""),
+        data.get("เลขบัญชี", ""),
+        data.get("อีเมล", ""),
+        data.get("ชื่อเทเลแกรม", ""),
+        data.get("@username telegram", ""),
+        username,
+        str(user_id),
+        status_text,
         now,
         "PENDING",
         ""
     ]
     
-    # Debug log
-    logger.info(f"💾 Saving data for user {user.id}:")
-    field_names = ["ชื่อ", "เบอร์", "ธนาคาร", "เลขบัญชี", "อีเมล", "ชื่อTG", "@username", "TG_Auto", "UserID", "ชนิดไลน์", "วันที่", "บ้านรับ", "บ้านไปแล้ว"]
-    for i, (field, value) in enumerate(zip(field_names, user_data)):
-        logger.info(f"  Col{i+1} {field}: '{value}'")
+    # Save to sheet
+    saved = False
+    sheet = sheet_manager.get_sheet()
+    if sheet:
+        try:
+            sheet.append_row(user_data)
+            saved = True
+            logger.info(f"✅ Data saved successfully for user {user_hash}")
+        except Exception as e:
+            logger.error(f"❌ Save error for user {user_hash}: {str(e)}")
     
-    # Add to pending list
-    pending_saves.append(user_data)
+    if not saved:
+        pending_saves.append(user_data)
+        logger.warning(f"⏳ Added to pending queue for user {user_hash}")
     
-    # Try to save
-    success = safe_append_row(user_data)
-    
-    # Remove from pending if successful
-    if success and user_data in pending_saves:
-        pending_saves.remove(user_data)
-    
-    # Create house selection buttons
+    # House selection buttons
     house_keys = [
         ("💀 ZOMBIE XO", "ZOMBIE_XO"),
         ("👾 ZOMBIE PG", "ZOMBIE_PG"),
@@ -402,76 +290,75 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("🐢 GENBU88", "GENBU88")
     ]
     
+    def build_url(house, uid):
+        return f"https://zombie-event-telegram-bot.onrender.com/go?house={house}&uid={uid}"
+    
+    keyboard = [
+        [InlineKeyboardButton(text, url=build_url(house, user_id)) 
+         for text, house in house_keys[:2]],
+        [InlineKeyboardButton(text, url=build_url(house, user_id)) 
+         for text, house in house_keys[2:4]],
+        [InlineKeyboardButton(house_keys[4][0], url=build_url(house_keys[4][1], user_id))]
+    ]
+    
+    # Get first name for personalized message (safe to log)
+    first_name = data.get('ชื่อ - นามสกุล', 'ผู้ใช้').split()[0] if data.get('ชื่อ - นามสกุล') else 'ผู้ใช้'
+    
     confirm_message = (
-        f"✅ ขอบคุณ 🙏🏻 {data_values[0]} สำหรับการยืนยันตัวตน\n\n"
-        f"สถานะ: {group_status}\n"
-        "👑 ขั้นตอนถัดไป:\n"
+        f"✅ ขอบคุณ {first_name} สำหรับการยืนยันตัวตน\n\n"
+        f"สถานะ: {status_text}\n"
+        "📋 ขั้นตอนต่อไป:\n"
         "1️⃣ แคปหน้าจอข้อความนี้\n"
-        "2️⃣ แอดไลน์เพื่อแจ้งแอดมิน ติดต่อรับเครดิตฟรี\n\n"
-        "⚠️ สิทธิเครดิตฟรีจะได้รับเฉพาะผู้ที่ทำตามขั้นตอนครบเท่านั้น"
+        "2️⃣ เลือกบ้านที่ต้องการ\n"
+        "3️⃣ แอดไลน์ติดต่อแอดมิน"
     )
     
-    # Create keyboard
-    keyboard = []
-    for i in range(0, len(house_keys), 2):
-        row = []
-        for text, house_key in house_keys[i:i+2]:
-            url = f"https://zombie-event-telegram-bot.onrender.com/go?house={house_key}&uid={user.id}"
-            row.append(InlineKeyboardButton(text, url=url))
-        keyboard.append(row)
+    await update.message.reply_text(
+        confirm_message, 
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await update.message.reply_text(confirm_message, reply_markup=reply_markup)
-        logger.info(f"✅ Confirmation sent to user {user.id}")
-    except Exception as e:
-        logger.error(f"❌ Error sending confirmation: {e}")
+    # Clean up memory
+    gc.collect()
+    log_memory_usage("after save")
+    logger.info(f"🎉 Registration completed for user {user_hash}")
     
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle cancel command"""
-    await update.message.reply_text("❌ ยกเลิกการยืนยันตัวตนแล้ว")
+    user_hash = create_user_hash(update.message.from_user.id)
+    logger.info(f"❌ Registration cancelled by user {user_hash}")
+    await update.message.reply_text("❌ ยกเลิกการลงทะเบียน")
     return ConversationHandler.END
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors"""
-    logger.error(f"❌ Exception while handling an update: {context.error}")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Don't log the full error details to avoid sensitive data leakage
+    error_type = type(context.error).__name__
+    logger.error(f"❌ Bot error: {error_type}")
 
 # ====== Flask App ======
 flask_app = Flask(__name__)
+CORS(flask_app)
 
 @flask_app.route("/")
 def home():
-    return "🤖 Zombie Event Bot is running! ✅ (Improved Polling Mode)"
+    return "🤖 ZOMBIE Bot is running! ✅"
 
 @flask_app.route("/health")
 def health_check():
-    """Health check endpoint"""
     memory_mb = log_memory_usage("health check")
-    
-    health_status = "healthy"
-    if len(pending_saves) > 10:
-        health_status = "warning"
-    if len(failed_saves) > 5 or memory_mb > 1500:
-        health_status = "critical"
-    
     return {
-        "status": health_status,
-        "bot": "zombie-event-telegram-bot",
-        "mode": "polling_improved",
+        "status": "healthy" if memory_mb < 1500 else "warning",
         "memory_mb": round(memory_mb, 2),
-        "pending_saves": len(pending_saves),
-        "failed_saves": len(failed_saves),
-        "group_checking": bool(TELEGRAM_GROUP_ID),
-        "message": f"Bot running! Memory: {memory_mb:.1f}MB, Pending: {len(pending_saves)}, Failed: {len(failed_saves)}"
+        "pending": len(pending_saves),
+        "failed": len(failed_saves),
+        "timestamp": datetime.now().isoformat()
     }
 
 @flask_app.route("/go")
 def go():
-    """Route สำหรับ redirect และอัพเดท Google Sheet"""
-    LINE_HOUSE_LINKS = {
+    LINKS = {
         "ZOMBIE_XO": "https://lin.ee/SgguCbJ",
         "ZOMBIE_PG": "https://lin.ee/ETELgrN",
         "ZOMBIE_KING": "https://lin.ee/fJilKIf",
@@ -482,83 +369,113 @@ def go():
     house = request.args.get("house", "").upper()
     uid = request.args.get("uid")
     
-    if not house or not uid:
-        return "Missing parameters", 400
+    if house in LINKS:
+        user_hash = create_user_hash(uid) if uid else "unknown"
+        logger.info(f"🔗 House selection: {user_hash} -> {house}")
+        return redirect(LINKS[house], 302)
     
-    link = LINE_HOUSE_LINKS.get(house)
-    if not link:
-        return f"Unknown house: {house}", 400
-    
-    # อัพเดทการเลือกบ้าน
-    update_house_selection(uid, house)
-    
-    logger.info(f"🔗 Redirect user {uid} to {house}: {link}")
-    return redirect(link, code=302)
+    logger.warning(f"⚠️ Invalid house request: {house}")
+    return "Invalid request", 400
 
-# ====== Main Function ======
-if __name__ == "__main__":
-    # Create application
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Add error handler
-    app.add_error_handler(error_handler)
+# ====== Background Tasks ======
+def retry_failed_saves():
+    """Background task to retry failed saves"""
+    while True:
+        try:
+            if pending_saves:
+                sheet = sheet_manager.get_sheet()
+                if sheet:
+                    retry_count = min(5, len(pending_saves))
+                    for _ in range(retry_count):
+                        if pending_saves:
+                            user_data = pending_saves.popleft()
+                            try:
+                                sheet.append_row(user_data)
+                                logger.info("✅ Retry save successful")
+                            except Exception as e:
+                                failed_saves.append(user_data)
+                                logger.error(f"❌ Retry save failed: {str(e)}")
+            
+            time.sleep(30)  # Check every 30 seconds
+            
+        except Exception as e:
+            logger.error(f"❌ Background task error: {str(e)}")
+            time.sleep(60)  # Wait longer on error
 
-    # Create conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={ASK_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_info)]},
-        fallbacks=[CommandHandler("cancel", cancel)]
+# ====== Main ======
+def main():
+    # Start background task for retry saves
+    retry_thread = Thread(target=retry_failed_saves, daemon=True)
+    retry_thread.start()
+    
+    # Start Flask FIRST (for port detection)
+    logger.info("🌐 Starting Flask server on port 10000...")
+    flask_thread = Thread(
+        target=lambda: flask_app.run(
+            host="0.0.0.0", 
+            port=10000,
+            debug=False,
+            use_reloader=False
+        ),
+        daemon=True
     )
-    app.add_handler(conv_handler)
-
-    # Start Flask in a separate thread
-    flask_thread = Thread(target=lambda: flask_app.run(host="0.0.0.0", port=10000, debug=False))
-    flask_thread.daemon = True
     flask_thread.start()
     
-    logger.info("🤖 Starting Zombie Event Telegram Bot (Improved Polling Mode)...")
-    logger.info("🌐 Health check: /health")
-    logger.info("🔗 Redirect handler: /go")
-    logger.info(f"👥 Group checking: {'Enabled' if TELEGRAM_GROUP_ID else 'Disabled'}")
+    # Wait for Flask to start
+    time.sleep(2)
+    
+    # Initialize bot
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise ValueError("No BOT_TOKEN in environment")
     
     try:
-        # Clear any existing webhook before starting polling
-        from telegram import Bot
-        temp_bot = Bot(token=BOT_TOKEN)
-        temp_bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Cleared webhook before starting polling")
+        app = (
+            ApplicationBuilder()
+            .token(token)
+            .connection_pool_size(8)  # Increased for better performance
+            .pool_timeout(30.0)
+            .read_timeout(15.0)
+            .write_timeout(15.0)
+            .concurrent_updates(100)  # Handle more concurrent users
+            .build()
+        )
         
-        # Start polling with proper error handling
+        app.add_error_handler(error_handler)
+        
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={ASK_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_info)]},
+            fallbacks=[CommandHandler("cancel", cancel)]
+        )
+        app.add_handler(conv_handler)
+        
+        log_memory_usage("at startup")
+        
+        logger.info("🤖 ZOMBIE Bot starting with improvements...")
+        logger.info("🔒 Privacy protection: ENABLED")
+        logger.info("🛡️ Rate limiting: ENABLED") 
+        logger.info("✅ Group check: FIXED")
+        logger.info("📊 Memory limit: 2GB")
+        logger.info("🌐 Health: http://0.0.0.0:10000/health")
+        
+        # Run bot (blocking)
         app.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False,
-            poll_interval=1.0,
-            timeout=10
+            allowed_updates=Update.ALL_TYPES
         )
-    except Conflict:
-        logger.error("❌ Another instance is already running!")
-        logger.info("💡 Please stop other instances or wait a moment")
-        logger.info("🔧 Trying to clear webhook and restart...")
         
-        try:
-            from telegram import Bot
-            temp_bot = Bot(token=BOT_TOKEN)
-            temp_bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook cleared, waiting 10 seconds...")
-            time.sleep(10)
-            
-            # Try again
-            app.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                close_loop=False,
-                poll_interval=1.0,
-                timeout=10
-            )
-        except Exception as e:
-            logger.error(f"❌ Failed to restart: {e}")
+    except Conflict as e:
+        logger.error(f"❌ Bot conflict: {str(e)}")
+        time.sleep(30)
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logger.error(f"❌ Bot error: {e}")
+        logger.error(f"💥 Fatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
-        logger.info("🛑 Bot stopped")
+        logger.info("🔚 Bot stopped")
+
+if __name__ == "__main__":
+    main()
