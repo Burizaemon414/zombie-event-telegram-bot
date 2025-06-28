@@ -335,6 +335,44 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+@flask_app.route("/go")
+def go():
+    """Route สำหรับ redirect ไป LINE และอัพเดท Sheet"""
+    LINKS = {
+        "ZOMBIE_XO": "https://lin.ee/SgguCbJ",
+        "ZOMBIE_PG": "https://lin.ee/ETELgrN",
+        "ZOMBIE_KING": "https://lin.ee/fJilKIf",
+        "ZOMBIE_ALL": "https://lin.ee/9eogsb8e",
+        "GENBU88": "https://lin.ee/JCCXt06"
+    }
+    
+    house = request.args.get("house", "").upper()
+    uid = request.args.get("uid")
+    
+    if house in LINKS and uid:
+        user_hash = create_user_hash(uid)
+        logger.info(f"House selection: {user_hash} chose {house}")
+        
+        # อัพเดท Google Sheet
+        try:
+            sheet = sheet_manager.get_sheet()
+            if sheet:
+                all_records = sheet.get_all_records()
+                for i, record in enumerate(all_records, start=2):  # start=2 เพราะ row 1 เป็น header
+                    if str(record.get('UserID', '')) == str(uid):
+                        # อัพเดท column L (column 12) 
+                        sheet.update_cell(i, 12, house)
+                        logger.info(f"Sheet updated: {user_hash} -> {house}")
+                        break
+        except Exception as e:
+            logger.error(f"Sheet update failed: {type(e).__name__}")
+        
+        # Redirect ไป LINE
+        return redirect(LINKS[house], 302)
+    
+    logger.warning(f"Invalid request: house={house}, uid={uid}")
+    return "Invalid request", 400
+
 @flask_app.route("/update-house", methods=["POST"])
 def update_house():
     try:
