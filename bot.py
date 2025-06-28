@@ -4,13 +4,10 @@ import json
 import base64
 from datetime import datetime
 from threading import Thread, Lock
-from flask import Flask, request, redirect
+from flask import Flask, request, redirect, jsonify
 from flask_cors import CORS
 import time
-import asyncio
 import logging
-import signal
-import sys
 import hashlib
 from collections import deque, defaultdict
 
@@ -37,10 +34,8 @@ from telegram.error import Conflict, NetworkError, TelegramError
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ====== CRITICAL: Disable all sensitive logging ======
+# ====== Secure Logging ======
 class NoSensitiveFilter(logging.Filter):
-    """Filter out any sensitive data from logs completely"""
-    
     SENSITIVE_PATTERNS = [
         r'\d{3,4}-?\d{3,4}-?\d{4}',  # Phone numbers
         r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Emails
@@ -52,29 +47,24 @@ class NoSensitiveFilter(logging.Filter):
         import re
         message = record.getMessage()
         
-        # Block any message containing sensitive patterns
         for pattern in self.SENSITIVE_PATTERNS:
             if re.search(pattern, message):
                 return False
         
-        # Block specific sensitive keywords
         sensitive_keywords = ['เบอร์', 'อีเมล', 'บัญชี', 'Col1', 'Col2', 'Col3', 'Col4', 'Col5']
         if any(keyword in message for keyword in sensitive_keywords):
             return False
             
         return True
 
-# Configure completely secure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 
-# Add the filter to ALL handlers
-secure_filter = NoSensitiveFilter()
 for handler in logging.root.handlers:
-    handler.addFilter(secure_filter)
+    handler.addFilter(NoSensitiveFilter())
 
 logger = logging.getLogger(__name__)
 
@@ -91,28 +81,16 @@ class RateLimiter:
             now = time.time()
             user_requests = self.requests[user_id]
             
-            # Clean old requests
             while user_requests and user_requests[0] < now - self.time_window:
                 user_requests.popleft()
             
-            # Check if under limit
             if len(user_requests) < self.max_requests:
                 user_requests.append(now)
                 return True
             
             return False
 
-# Initialize rate limiter (stricter limits)
 rate_limiter = RateLimiter(max_requests=3, time_window=60)
-
-# ====== Memory Monitoring ======
-def log_memory_usage(context=""):
-    """Log current memory usage"""
-    import resource
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    memory_mb = usage.ru_maxrss / 1024
-    logger.info(f"Memory {context}: {memory_mb:.1f} MB")
-    return memory_mb
 
 # ====== Google Sheet Manager ======
 class LightweightSheetManager:
@@ -123,7 +101,6 @@ class LightweightSheetManager:
         self._lock = Lock()
     
     def get_sheet(self):
-        """Get sheet with connection pooling"""
         with self._lock:
             now = time.time()
             if self.sheet and self.last_connect and (now - self.last_connect < self.connect_interval):
@@ -151,35 +128,39 @@ class LightweightSheetManager:
                 logger.error(f"Sheet connection failed: {type(e).__name__}")
                 return None
 
-# Initialize
 sheet_manager = LightweightSheetManager()
 
-# Bot Config
+# ====== Config ======
 ASK_INFO = range(1)
 GROUP_ID = -1002561643127
-
 pending_saves = deque(maxlen=100)
 failed_saves = deque(maxlen=50)
 
-# ====== Helper Functions ======
 def create_user_hash(user_id):
-    """Create hash for user logging (privacy)"""
     return hashlib.md5(str(user_id).encode()).hexdigest()[:8]
 
-async def check_group_membership_fixed(context, user_id):
-    """FIXED group membership check - exact code from working bot"""
+def log_memory_usage(context=""):
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    memory_mb = usage.ru_maxrss / 1024
+    logger.info(f"Memory {context}: {memory_mb:.1f} MB")
+    return memory_mb
+
+def update_house_in_sheet(uid, house):
+    """อัพเดท house ใน Google Sheet"""
     try:
-        # This is the EXACT working code from bot_fixed_final.py
-        member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
-        in_group = member.status in ['member', 'administrator', 'creator']
-        
-        user_hash = create_user_hash(user_id)
-        logger.info(f"Group check result for user {user_hash}: {'IN_GROUP' if in_group else 'NOT_IN_GROUP'}")
-        return in_group
-        
+        user_hash = create_user_hash(uid)
+        sheet = sheet_manager.get_sheet()
+        if sheet:
+            all_records = sheet.get_all_records()
+            for i, record in enumerate(all_records, start=2):
+                if str(record.get('UserID', '')) == str(uid):
+                    sheet.update_cell(i, 12, house)  # Column L
+                    logger.info(f"Sheet updated: {user_hash} -> {house}")
+                    return True
+        return False
     except Exception as e:
-        user_hash = create_user_hash(user_id)
-        logger.error(f"Group check failed for user {user_hash}: {type(e).__name__}")
+        logger.error(f"Sheet update failed: {type(e).__name__}")
         return False
 
 # ====== Bot Handlers ======
@@ -187,13 +168,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_hash = create_user_hash(user_id)
     
-    # Rate limiting check
     if not rate_limiter.is_allowed(user_id):
         await update.message.reply_text("⏱️ กรุณารอสักครู่ก่อนส่งคำสั่งใหม่")
         logger.warning(f"Rate limit exceeded for user {user_hash}")
         return ConversationHandler.END
     
-    log_memory_usage("start")
     logger.info(f"Start command from user {user_hash}")
     
     welcome_message = (
@@ -218,7 +197,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_hash = create_user_hash(user_id)
     text = update.message.text
     
-    # Rate limiting check
     if not rate_limiter.is_allowed(user_id):
         await update.message.reply_text("⏱️ กรุณารอสักครู่ก่อนส่งข้อมูลใหม่")
         return ASK_INFO
@@ -229,7 +207,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ ข้อมูลไม่ครบ กรุณากรอกให้ครบทุกช่อง")
         return ASK_INFO
     
-    # Parse data WITHOUT logging any sensitive information
+    # Parse data
     data = {}
     for line in text.strip().splitlines():
         if ':' in line:
@@ -243,28 +221,23 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     username = user.username or "ไม่มี"
     
-    # CRITICAL FIX: Use the exact working group check code
-    logger.info(f"Starting group membership check for user {user_hash}")
-    
+    # Group check
+    logger.info(f"Group check for user {user_hash}")
     try:
-        # This is the EXACT code from bot_fixed_final.py that works
         member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
         in_group = member.status in ['member', 'administrator', 'creator']
-        
-        logger.info(f"Group check SUCCESS for user {user_hash}: {'MEMBER' if in_group else 'NOT_MEMBER'}")
-        
+        logger.info(f"Group check: {user_hash} -> {'MEMBER' if in_group else 'NOT_MEMBER'}")
     except Exception as e:
-        logger.error(f"Group check FAILED for user {user_hash}: {type(e).__name__}")
+        logger.error(f"Group check failed for user {user_hash}: {type(e).__name__}")
         in_group = False
     
     status_text = "✅ อยู่ในกลุ่มแล้ว" if in_group else "❌ ยังไม่ได้เข้ากลุ่ม"
-    logger.info(f"Final status for user {user_hash}: {status_text}")
     
     import pytz
     bangkok_tz = pytz.timezone('Asia/Bangkok')
     now = datetime.now(bangkok_tz).strftime("%Y-%m-%d %H:%M:%S")
     
-    # Prepare data for sheet (NO LOGGING OF ACTUAL DATA)
+    # Save to sheet
     user_data = [
         data.get("ชื่อ - นามสกุล", ""),
         data.get("เบอร์โทร", ""),
@@ -281,14 +254,13 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ""
     ]
     
-    # Save to sheet (NO sensitive data in logs)
     saved = False
     sheet = sheet_manager.get_sheet()
     if sheet:
         try:
             sheet.append_row(user_data)
             saved = True
-            logger.info(f"Data saved successfully for user {user_hash}")
+            logger.info(f"Data saved for user {user_hash}")
         except Exception as e:
             logger.error(f"Save failed for user {user_hash}: {type(e).__name__}")
     
@@ -306,7 +278,7 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     def build_url(house, uid):
-        return f"https://zombie-event-telegram-bot.onrender.com/go?house={house}&uid={uid}"
+        return f"https://activate-creditfree.slotzombies.net/go?house={house}&uid={uid}"
     
     keyboard = [
         [InlineKeyboardButton(text, url=build_url(house, user_id)) 
@@ -316,7 +288,6 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(house_keys[4][0], url=build_url(house_keys[4][1], user_id))]
     ]
     
-    # Get first name only (safe)
     first_name = data.get('ชื่อ - นามสกุล', 'ผู้ใช้').split()[0] if data.get('ชื่อ - นามสกุล') else 'ผู้ใช้'
     
     confirm_message = (
@@ -328,15 +299,9 @@ async def get_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ แอดไลน์ติดต่อแอดมิน"
     )
     
-    await update.message.reply_text(
-        confirm_message, 
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text(confirm_message, reply_markup=InlineKeyboardMarkup(keyboard))
     
-    # Clean up memory
     gc.collect()
-    log_memory_usage("after_save")
     logger.info(f"Registration completed for user {user_hash}")
     
     return ConversationHandler.END
@@ -348,9 +313,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    # Only log error type, never details
     error_type = type(context.error).__name__
-    logger.error(f"Bot error occurred: {error_type}")
+    logger.error(f"Bot error: {error_type}")
 
 # ====== Flask App ======
 flask_app = Flask(__name__)
@@ -358,7 +322,7 @@ CORS(flask_app)
 
 @flask_app.route("/")
 def home():
-    return "ZOMBIE Bot v2.0 - Privacy Protected ✅"
+    return "ZOMBIE Bot v3.0 - Cloudflare Integration ✅"
 
 @flask_app.route("/health")
 def health_check():
@@ -371,68 +335,72 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-@flask_app.route("/go")
-def go():
-    LINKS = {
-        "ZOMBIE_XO": "https://lin.ee/SgguCbJ",
-        "ZOMBIE_PG": "https://lin.ee/ETELgrN",
-        "ZOMBIE_KING": "https://lin.ee/fJilKIf",
-        "ZOMBIE_ALL": "https://lin.ee/9eogsb8e",
-        "GENBU88": "https://lin.ee/JCCXt06"
-    }
-    
-    house = request.args.get("house", "").upper()
-    uid = request.args.get("uid")
-    
-    if house in LINKS and uid:
-        user_hash = create_user_hash(uid)
-        logger.info(f"House selection: {user_hash} chose {house}")
+@flask_app.route("/update-house", methods=["POST"])
+def update_house():
+    try:
+        data = request.get_json()
+        house = data.get("house", "").upper()
+        uid = data.get("uid")
         
-        # อัพเดท Google Sheet
+        if house and uid:
+            user_hash = create_user_hash(uid)
+            logger.info(f"API house update: {user_hash} -> {house}")
+            
+            if update_house_in_sheet(uid, house):
+                return {"status": "success", "house": house}, 200
+            else:
+                return {"status": "failed"}, 500
+        
+        return {"status": "invalid_data"}, 400
+        
+    except Exception as e:
+        logger.error(f"API error: {type(e).__name__}")
+        return {"status": "error"}, 500
+
+# ====== Background Tasks ======
+def retry_failed_saves():
+    while True:
         try:
-            sheet = sheet_manager.get_sheet()
-            if sheet:
-                # หา user จาก user_id (column I = column 9)
-                all_records = sheet.get_all_records()
-                for i, record in enumerate(all_records, start=2):  # start=2 เพราะ row 1 เป็น header
-                    if str(record.get('UserID', '')) == str(uid):
-                        # อัพเดท column M (column 13) จาก PENDING เป็น house name
-                        sheet.update_cell(i, 13, house)
-                        logger.info(f"Sheet updated: {user_hash} -> {house}")
-                        break
+            if pending_saves:
+                sheet = sheet_manager.get_sheet()
+                if sheet:
+                    retry_count = min(3, len(pending_saves))
+                    for _ in range(retry_count):
+                        if pending_saves:
+                            user_data = pending_saves.popleft()
+                            try:
+                                sheet.append_row(user_data)
+                                logger.info("Retry save successful")
+                            except Exception as e:
+                                failed_saves.append(user_data)
+                                logger.error(f"Retry save failed: {type(e).__name__}")
+            
+            time.sleep(30)
+            
         except Exception as e:
-            logger.error(f"Sheet update failed: {type(e).__name__}")
-        
-        return redirect(LINKS[house], 302)
-    
-    logger.warning(f"Invalid request: house={house}, uid={uid}")
-    return "Invalid request", 400
+            logger.error(f"Background task error: {type(e).__name__}")
+            time.sleep(60)
 
 # ====== Main ======
 def main():
-    # Start background task
+    # Background task
     retry_thread = Thread(target=retry_failed_saves, daemon=True)
     retry_thread.start()
     
-    # Start Flask
-    logger.info("Starting Flask server on port 10000...")
+    # Flask server
+    logger.info("Starting Flask on port 10000...")
     flask_thread = Thread(
-        target=lambda: flask_app.run(
-            host="0.0.0.0", 
-            port=10000,
-            debug=False,
-            use_reloader=False
-        ),
+        target=lambda: flask_app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False),
         daemon=True
     )
     flask_thread.start()
     
     time.sleep(2)
     
-    # Initialize bot
+    # Bot
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise ValueError("No BOT_TOKEN in environment")
+        raise ValueError("No BOT_TOKEN")
     
     try:
         app = (
@@ -457,29 +425,23 @@ def main():
         
         log_memory_usage("startup")
         
-        logger.info("=== ZOMBIE Bot v2.0 Starting ===")
-        logger.info("PRIVACY: Maximum protection enabled")
-        logger.info("GROUP_CHECK: Fixed with working code")
-        logger.info("RATE_LIMIT: 3 requests/minute per user")
-        logger.info("PERFORMANCE: Optimized for 400+ users")
-        logger.info("Health check: /health")
+        logger.info("=== ZOMBIE Bot v3.0 Starting ===")
+        logger.info("CLOUDFLARE: Integration enabled")
+        logger.info("PRIVACY: Protected")
+        logger.info("GROUP_CHECK: Working")
+        logger.info("🤖 Starting polling...")
         
-        # Run bot with drop_pending_updates to clear webhook conflicts
-        logger.info("🤖 Starting bot with polling...")
-        app.run_polling(
-            drop_pending_updates=True,  # This will clear webhook automatically
-            allowed_updates=Update.ALL_TYPES
-        )
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         
     except Conflict as e:
-        logger.error(f"Bot conflict detected: {type(e).__name__}")
+        logger.error(f"Bot conflict: {type(e).__name__}")
         time.sleep(30)
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {type(e).__name__}")
     finally:
-        logger.info("Bot shutdown complete")
+        logger.info("Bot shutdown")
 
 if __name__ == "__main__":
     main()
