@@ -384,38 +384,29 @@ def go():
     house = request.args.get("house", "").upper()
     uid = request.args.get("uid")
     
-    if house in LINKS:
-        user_hash = create_user_hash(uid) if uid else "unknown"
+    if house in LINKS and uid:
+        user_hash = create_user_hash(uid)
         logger.info(f"House selection: {user_hash} chose {house}")
+        
+        # อัพเดท Google Sheet
+        try:
+            sheet = sheet_manager.get_sheet()
+            if sheet:
+                # หา user จาก user_id (column I = column 9)
+                all_records = sheet.get_all_records()
+                for i, record in enumerate(all_records, start=2):  # start=2 เพราะ row 1 เป็น header
+                    if str(record.get('UserID', '')) == str(uid):
+                        # อัพเดท column M (column 13) จาก PENDING เป็น house name
+                        sheet.update_cell(i, 13, house)
+                        logger.info(f"Sheet updated: {user_hash} -> {house}")
+                        break
+        except Exception as e:
+            logger.error(f"Sheet update failed: {type(e).__name__}")
+        
         return redirect(LINKS[house], 302)
     
-    logger.warning(f"Invalid house request: {house}")
+    logger.warning(f"Invalid request: house={house}, uid={uid}")
     return "Invalid request", 400
-
-# ====== Background Tasks ======
-def retry_failed_saves():
-    """Background task to retry failed saves"""
-    while True:
-        try:
-            if pending_saves:
-                sheet = sheet_manager.get_sheet()
-                if sheet:
-                    retry_count = min(3, len(pending_saves))
-                    for _ in range(retry_count):
-                        if pending_saves:
-                            user_data = pending_saves.popleft()
-                            try:
-                                sheet.append_row(user_data)
-                                logger.info("Retry save successful")
-                            except Exception as e:
-                                failed_saves.append(user_data)
-                                logger.error(f"Retry save failed: {type(e).__name__}")
-            
-            time.sleep(30)
-            
-        except Exception as e:
-            logger.error(f"Background task error: {type(e).__name__}")
-            time.sleep(60)
 
 # ====== Main ======
 def main():
