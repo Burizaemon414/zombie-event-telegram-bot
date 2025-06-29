@@ -147,20 +147,39 @@ def log_memory_usage(context=""):
     return memory_mb
 
 def update_house_in_sheet(uid, house):
-    """อัพเดท house ใน Google Sheet"""
     try:
-        user_hash = create_user_hash(uid)
         sheet = sheet_manager.get_sheet()
-        if sheet:
-            all_records = sheet.get_all_records()
-            for i, record in enumerate(all_records, start=2):
-                if str(record.get('User ID', '')) == str(uid):
-                    sheet.update_cell(i, 12, house)  # Column L
-                    logger.info(f"Sheet updated: {user_hash} -> {house}")
-                    return True
-        return False
+        if not sheet:
+            return False
+
+        records = sheet.get_all_records()
+        # หาแถวสุดท้ายที่ User ID ตรงกับ uid
+        matched = [
+            (row, rec) for row, rec in enumerate(records, start=2)
+            if str(rec.get("User ID", "")) == str(uid)
+        ]
+        if not matched:
+            return False
+
+        row_num, row_data = matched[-1]
+
+        # 1) อัปเดต L (column 12)
+        sheet.update_cell(row_num, 12, house)
+
+        # 2) อัปเดต M (column 13) อ่านจาก header 'บ้านที่รับไปแล้ว'
+        prev = row_data.get("บ้านที่รับไปแล้ว", "") or ""
+        prev_list = [h.strip() for h in prev.split(",") if h.strip()]
+
+        # เอาบ้านใหม่ไว้หน้า และลบของเดิมถ้ามีอยู่แล้ว
+        if house in prev_list:
+            prev_list.remove(house)
+        new_history = [house] + prev_list
+        sheet.update_cell(row_num, 13, ", ".join(new_history))
+
+        return True
+
     except Exception as e:
-        logger.error(f"Sheet update failed: {type(e).__name__}")
+        logger.error(f"UpdateHouse error: {type(e).__name__}")
         return False
 
 # ====== Bot Handlers ======
@@ -335,40 +354,39 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-@flask_app.route("/go")
+@flask_app.route("/go", methods=["GET"])
 def go():
-    """Route สำหรับ redirect ไป LINE และอัพเดท Sheet"""
     LINKS = {
-        "ZOMBIE_XO": "https://lin.ee/SgguCbJ",
-        "ZOMBIE_PG": "https://lin.ee/ETELgrN",
+        "ZOMBIE_XO":   "https://lin.ee/SgguCbJ",
+        "ZOMBIE_PG":   "https://lin.ee/ETELgrN",
         "ZOMBIE_KING": "https://lin.ee/fJilKIf",
-        "ZOMBIE_ALL": "https://lin.ee/9eogsb8e",
-        "GENBU88": "https://lin.ee/JCCXt06"
+        "ZOMBIE_ALL":  "https://lin.ee/9eogsb8e",
+        "GENBU88":     "https://lin.ee/JCCXt06"
     }
-    
     house = request.args.get("house", "").upper()
-    uid = request.args.get("uid")
-    
+    uid   = request.args.get("uid", "")
     if house in LINKS and uid:
-        user_hash = create_user_hash(uid)
-        logger.info(f"House selection: {user_hash} chose {house}")
-        
-        # อัพเดท Google Sheet
-        try:
-            sheet = sheet_manager.get_sheet()
-            if sheet:
-                all_records = sheet.get_all_records()
-                for i, record in enumerate(all_records, start=2):  # start=2 เพราะ row 1 เป็น header
-                    if str(record.get('User ID', '')) == str(uid):
-                        # อัพเดท column L (column 12) 
-                        sheet.update_cell(i, 12, house)
-                        logger.info(f"Sheet updated: {user_hash} -> {house}")
-                        break
-        except Exception as e:
-            logger.error(f"Sheet update failed: {type(e).__name__}")
-        
-        # Redirect ไป LINE
+        sheet = sheet_manager.get_sheet()
+        if sheet:
+            records = sheet.get_all_records()
+            # หาแถวสุดท้ายของ UID
+            matched = [
+                (i, r) for i, r in enumerate(records, start=2)
+                if str(r.get("User ID", "")) == uid
+            ]
+            if matched:
+                row_num, row_data = matched[-1]
+                # อัปเดต L (column 12)
+                sheet.update_cell(row_num, 12, house)
+                # อัปเดต M (column 13) อ่านจาก header 'บ้านที่รับไปแล้ว'
+                prev = row_data.get("บ้านที่รับไปแล้ว", "") or ""
+                prev_list = [h.strip() for h in prev.split(",") if h.strip()]
+                if house in prev_list:
+                    prev_list.remove(house)
+                history = [house] + prev_list
+                sheet.update_cell(row_num, 13, ", ".join(history))
         return redirect(LINKS[house], 302)
+    return "Invalid request", 400
     
     logger.warning(f"Invalid request: house={house}, uid={uid}")
     return "Invalid request", 400
