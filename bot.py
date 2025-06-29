@@ -154,7 +154,7 @@ def update_house_in_sheet(uid, house):
         if sheet:
             all_records = sheet.get_all_records()
             for i, record in enumerate(all_records, start=2):
-                if str(record.get('UserID', '')) == str(uid):
+                if str(record.get('User ID', '')) == str(uid):
                     sheet.update_cell(i, 12, house)  # Column L
                     logger.info(f"Sheet updated: {user_hash} -> {house}")
                     return True
@@ -359,7 +359,7 @@ def go():
             if sheet:
                 all_records = sheet.get_all_records()
                 for i, record in enumerate(all_records, start=2):  # start=2 เพราะ row 1 เป็น header
-                    if str(record.get('UserID', '')) == str(uid):
+                    if str(record.get('User ID', '')) == str(uid):
                         # อัพเดท column L (column 12) 
                         sheet.update_cell(i, 12, house)
                         logger.info(f"Sheet updated: {user_hash} -> {house}")
