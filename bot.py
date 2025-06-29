@@ -152,29 +152,35 @@ def update_house_in_sheet(uid, house):
         if not sheet:
             return False
 
+        # ดึงข้อมูลทั้งหมดและหาแถวของ UID
         records = sheet.get_all_records()
-        # หาแถวสุดท้ายที่ User ID ตรงกับ uid
         matched = [
-            (row, rec) for row, rec in enumerate(records, start=2)
+            (row, rec)
+            for row, rec in enumerate(records, start=2)
             if str(rec.get("User ID", "")) == str(uid)
         ]
         if not matched:
             return False
 
-        row_num, row_data = matched[-1]
+        # เอาแถวล่าสุด (submission ใหม่) มาอัปเดต
+        curr_row, curr_data = matched[-1]
 
-        # 1) อัปเดต L (column 12)
-        sheet.update_cell(row_num, 12, house)
+        # เตรียมประวัติจากแถวก่อนหน้า (ถ้ามี)
+        if len(matched) > 1:
+            _, prev_data = matched[-2]
+            prev_history = prev_data.get("บ้านที่รับไปแล้ว", "") or ""
+        else:
+            prev_history = ""
 
-        # 2) อัปเดต M (column 13) อ่านจาก header 'บ้านที่รับไปแล้ว'
-        prev = row_data.get("บ้านที่รับไปแล้ว", "") or ""
-        prev_list = [h.strip() for h in prev.split(",") if h.strip()]
-
-        # เอาบ้านใหม่ไว้หน้า และลบของเดิมถ้ามีอยู่แล้ว
+        prev_list = [h.strip() for h in prev_history.split(",") if h.strip()]
         if house in prev_list:
             prev_list.remove(house)
+
+        # 1) อัปเดต L (column 12) ให้เป็นบ้านล่าสุด
+        sheet.update_cell(curr_row, 12, house)
+        # 2) อัปเดต M (column 13) ให้เป็น history ใหม่
         new_history = [house] + prev_list
-        sheet.update_cell(row_num, 13, ", ".join(new_history))
+        sheet.update_cell(curr_row, 13, ", ".join(new_history))
 
         return True
 
@@ -356,6 +362,7 @@ def health_check():
 
 @flask_app.route("/go", methods=["GET"])
 def go():
+    # กำหนดลิงก์ของแต่ละบ้าน
     LINKS = {
         "ZOMBIE_XO":   "https://lin.ee/SgguCbJ",
         "ZOMBIE_PG":   "https://lin.ee/ETELgrN",
@@ -363,33 +370,51 @@ def go():
         "ZOMBIE_ALL":  "https://lin.ee/9eogsb8e",
         "GENBU88":     "https://lin.ee/JCCXt06"
     }
+
+    # ดึงพารามิเตอร์จาก URL
     house = request.args.get("house", "").upper()
     uid   = request.args.get("uid", "")
-    if house in LINKS and uid:
-        sheet = sheet_manager.get_sheet()
-        if sheet:
-            records = sheet.get_all_records()
-            # หาแถวสุดท้ายของ UID
-            matched = [
-                (i, r) for i, r in enumerate(records, start=2)
-                if str(r.get("User ID", "")) == uid
-            ]
-            if matched:
-                row_num, row_data = matched[-1]
-                # อัปเดต L (column 12)
-                sheet.update_cell(row_num, 12, house)
-                # อัปเดต M (column 13) อ่านจาก header 'บ้านที่รับไปแล้ว'
-                prev = row_data.get("บ้านที่รับไปแล้ว", "") or ""
-                prev_list = [h.strip() for h in prev.split(",") if h.strip()]
-                if house in prev_list:
-                    prev_list.remove(house)
-                history = [house] + prev_list
-                sheet.update_cell(row_num, 13, ", ".join(history))
-        return redirect(LINKS[house], 302)
-    return "Invalid request", 400
-    
-    logger.warning(f"Invalid request: house={house}, uid={uid}")
-    return "Invalid request", 400
+
+    # เช็กพารามิเตอร์เบื้องต้นก่อน
+    if not house or not uid or house not in LINKS:
+        logger.warning(f"Invalid request: house={house}, uid={uid}")
+        return "Invalid request", 400
+
+    # พยายามเชื่อมชีต
+    sheet = sheet_manager.get_sheet()
+    if sheet:
+        # อ่านข้อมูลทั้งหมด
+        records = sheet.get_all_records()
+        # หาแถวทั้งหมดที่ User ID ตรงกัน
+        matched = [
+            (row, rec)
+            for row, rec in enumerate(records, start=2)
+            if str(rec.get("User ID", "")) == str(uid)
+        ]
+
+        if matched:
+            # เอาแถวล่าสุดของ UID มาอัปเดต
+            curr_row, curr_data = matched[-1]
+
+            # เตรียมประวัติจากแถวก่อนหน้า (ถ้ามี)
+            if len(matched) > 1:
+                _, prev_data = matched[-2]
+                prev_history = prev_data.get("บ้านที่รับไปแล้ว", "") or ""
+            else:
+                prev_history = ""
+
+            prev_list = [h.strip() for h in prev_history.split(",") if h.strip()]
+            if house in prev_list:
+                prev_list.remove(house)
+
+            # 1) อัปเดต L (column 12) ให้เป็นบ้านล่าสุด
+            sheet.update_cell(curr_row, 12, house)
+            # 2) อัปเดต M (column 13) ให้เป็นประวัติใหม่
+            new_history = [house] + prev_list
+            sheet.update_cell(curr_row, 13, ", ".join(new_history))
+
+    # ส่งต่อไปยัง LINE OA ตามบ้านที่เลือก
+    return redirect(LINKS[house], 302)
 
 @flask_app.route("/update-house", methods=["POST"])
 def update_house():
